@@ -1,0 +1,247 @@
+package me.kgrigoriy;
+
+import com.microsoft.playwright.*;
+import com.microsoft.playwright.options.LoadState;
+import com.microsoft.playwright.options.ScreenshotType;
+
+import javafx.application.Application;
+import javafx.application.Platform;
+import javafx.geometry.Insets;
+import javafx.geometry.Pos;
+import javafx.scene.Scene;
+import javafx.scene.control.*;
+import javafx.scene.image.Image;
+import javafx.scene.layout.*;
+import javafx.stage.FileChooser;
+import javafx.stage.Stage;
+
+import org.apache.pdfbox.pdmodel.*;
+import org.apache.pdfbox.pdmodel.common.PDRectangle;
+import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.*;
+import java.util.*;
+import java.util.regex.*;
+
+public class Main {
+    public static void main(String[] args) {
+        App.run(args);
+    }
+
+    public static enum Google {
+        Presentation(1920, 1080,
+                "https://docs.google.com/presentation/d/",
+                "docs\\.google\\.com/presentation/d/([a-zA-Z0-9_-]+)"),
+        Document(1000, 1150,
+                "https://docs.google.com/document/d/",
+                "docs\\.google\\.com/document/d/([a-zA-Z0-9_-]+)");
+
+        static final long DOC_SCROLL_STEP = 1133;
+        static final String PREVIEW = "/preview";
+        static final double SCALE = 3.0;
+        static final int MAX_PAGES = 1000;
+
+        final int width, height;
+        final String prefix, regex;
+
+        Google(int w, int h, String p, String r) {
+            width = w;
+            height = h;
+            prefix = p;
+            regex = r;
+        }
+    }
+
+    public static record Link(Google t, String url) {
+    }
+
+    public static class App extends Application {
+        public static void run(String[] args) {
+            launch(args);
+        }
+
+        private TextField urlField;
+        private TextField outputField;
+        private Button convertButton;
+        private TextArea logArea;
+        private Stage primaryStage;
+
+        @Override
+        public void start(Stage stage) {
+            this.primaryStage = stage;
+            stage.setTitle("GoogleDocs2PDF by KGrigoriy for Anna💕 v1.0");
+            stage.getIcons().add(new Image(getClass().getResourceAsStream("/icon.png")));
+
+            Label urlLabel = new Label("Ссылка:");
+            urlLabel.setMinWidth(80);
+            urlField = new TextField();
+            urlField.setPromptText("https://docs.google.com/");
+            HBox.setHgrow(urlField, Priority.ALWAYS);
+            HBox urlRow = new HBox(8, urlLabel, urlField);
+            urlRow.setAlignment(Pos.CENTER_LEFT);
+
+            Label outLabel = new Label("Сохранить:");
+            outLabel.setMinWidth(80);
+            outputField = new TextField();
+            outputField.setPromptText("output.pdf");
+            HBox.setHgrow(outputField, Priority.ALWAYS);
+            Button browseBtn = new Button("Обзор");
+            browseBtn.setOnAction(e -> {
+
+                FileChooser fc = new FileChooser();
+                fc.setTitle("Сохранить PDF как");
+                fc.getExtensionFilters().add(
+                        new FileChooser.ExtensionFilter("PDF файлы", "*.pdf"));
+                fc.setInitialFileName("output.pdf");
+                File file = fc.showSaveDialog(primaryStage);
+                if (file != null)
+                    outputField.setText(file.getAbsolutePath());
+
+            });
+            HBox outRow = new HBox(8, outLabel, outputField, browseBtn);
+            outRow.setAlignment(Pos.CENTER_LEFT);
+
+            convertButton = new Button("Конвертировать");
+            convertButton.setDefaultButton(true);
+            convertButton.setOnAction(e -> {
+
+                String rawUrl = urlField.getText().trim();
+                String outputPath = outputField.getText().trim();
+
+                if (rawUrl.isEmpty()) {
+                    log("Введите ссылку");
+                    return;
+                }
+                if (outputPath.isEmpty()) {
+                    log("Введите имя файла для сохранения");
+                    return;
+                }
+
+                Link link = parseLink(rawUrl);
+                if (link == null) {
+                    log("Некорректная ссылка: поддерживаются Google Slides и Google Docs");
+                    return;
+                }
+
+                convertButton.setDisable(true);
+                logArea.clear();
+
+                new Thread(() -> {
+                    try {
+                        log("Тип документа: " + link.t().name());
+                        ensureChromiumInstalled();
+                        try (PDDocument pdf = new PDDocument();
+                                Playwright playwright = Playwright.create();
+                                Browser browser = playwright.chromium().launch(
+                                        new BrowserType.LaunchOptions().setHeadless(true));
+                                BrowserContext ctx = browser.newContext(
+                                        new Browser.NewContextOptions().setDeviceScaleFactor(Google.SCALE));
+                                Page page = ctx.newPage()) {
+                            parsePage(page, link, pdf);
+                            pdf.save(outputPath);
+                            log("PDF сохранён: " + outputPath);
+                        }
+                    } catch (Exception ex) {
+                        log("Ошибка: " + ex);
+                    } finally {
+                        Platform.runLater(() -> convertButton.setDisable(false));
+                    }
+                }, "converter-thread").start();
+
+            });
+            HBox btnRow = new HBox(convertButton);
+            btnRow.setAlignment(Pos.CENTER_RIGHT);
+
+            logArea = new TextArea();
+            logArea.setEditable(false);
+            logArea.setPrefHeight(230);
+            logArea.setWrapText(true);
+            logArea.setStyle("-fx-font-family: 'Courier New', monospace; -fx-font-size: 12px;");
+            VBox.setVgrow(logArea, Priority.ALWAYS);
+
+            VBox root = new VBox(10, urlRow, outRow, btnRow, new Label("Лог:"), logArea);
+            root.setPadding(new Insets(16));
+
+            stage.setScene(new Scene(root, 680, 440));
+            stage.setMinWidth(500);
+            stage.setMinHeight(380);
+            stage.show();
+        }
+
+        private void log(String msg) {
+            Platform.runLater(() -> logArea.appendText(msg + "\n"));
+        }
+
+        private Link parseLink(String link) {
+            Matcher slides = Pattern.compile(Google.Presentation.regex).matcher(link);
+            if (slides.find())
+                return new Link(Google.Presentation, Google.Presentation.prefix + slides.group(1) + Google.PREVIEW);
+            Matcher docs = Pattern.compile(Google.Document.regex).matcher(link);
+            if (docs.find())
+                return new Link(Google.Document, Google.Document.prefix + docs.group(1) + Google.PREVIEW);
+            return null;
+        }
+
+        private Path getCachePath() {
+            String os = System.getProperty("os.name").toLowerCase();
+            String home = System.getProperty("user.home");
+            if (os.contains("win"))
+                return Paths.get(home, "AppData", "Local", "ms-playwright");
+            if (os.contains("mac") || os.contains("darwin"))
+                return Paths.get(home, "Library", "Caches", "ms-playwright");
+            return Paths.get(home, ".cache", "ms-playwright");
+        }
+
+        private void ensureChromiumInstalled() throws IOException, InterruptedException {
+            if (Files.exists(getCachePath())) {
+                log("Chromium уже установлен");
+                return;
+            }
+            log("Устанавливаю Chromium");
+            ProcessBuilder pb = new ProcessBuilder(
+                    "java", "-cp", System.getProperty("java.class.path"),
+                    "com.microsoft.playwright.CLI", "install", "chromium");
+            pb.inheritIO();
+            int code = pb.start().waitFor();
+            if (code != 0)
+                throw new IOException("Код выхода: " + code);
+            log("Chromium установлен");
+        }
+
+        private void parsePage(Page page, Link link, PDDocument pdf) throws IOException {
+            page.setViewportSize(link.t().width, link.t().height);
+            byte[] prev = null;
+            for (int num = 1; num <= Google.MAX_PAGES; num++) {
+                if (link.t() == Google.Presentation || num == 1) {
+                    String anchor = (link.t() == Google.Presentation) ? "#slide=id.p" + num : "";
+                    page.navigate(link.url() + anchor);
+                    page.waitForLoadState(LoadState.NETWORKIDLE,
+                            new Page.WaitForLoadStateOptions());
+                }
+                byte[] shot = page.screenshot(
+                        new Page.ScreenshotOptions()
+                                .setType(ScreenshotType.PNG).setFullPage(false));
+                if (Arrays.equals(prev, shot)) {
+                    log("Страниц всего: " + (num - 1));
+                    return;
+                }
+                PDImageXObject img = PDImageXObject.createFromByteArray(pdf, shot, "p" + num);
+                float w = img.getWidth() / (float) Google.SCALE;
+                float h = img.getHeight() / (float) Google.SCALE;
+                PDPage pdfPage = new PDPage(new PDRectangle(w, h));
+                pdf.addPage(pdfPage);
+                try (PDPageContentStream cs = new PDPageContentStream(pdf, pdfPage)) {
+                    cs.drawImage(img, 0, 0, w, h);
+                }
+                log("Страница: " + num);
+                prev = shot;
+                if (link.t() == Google.Document)
+                    page.mouse().wheel(0, Google.DOC_SCROLL_STEP);
+            }
+            log("ВНИМАНИЕ: достигнут лимит в " + Google.MAX_PAGES + " страниц");
+        }
+    }
+
+}
