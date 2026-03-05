@@ -356,7 +356,7 @@ public class Main {
 
                 } catch (Exception e) {
                     if (num == 1)
-                        throw new IOException("Ошибка загрузки первой страницы: " + e, e);
+                        throw new IOException("Ошибка загрузки первой страницы", e);
                     log("Страница " + num + " недоступна, пропускаю: " + e);
                     if (link.t() == Google.Presentation && prev != null) {
                         log("Страниц всего: " + saved);
@@ -403,15 +403,23 @@ public class Main {
 
                 List<List<Word>> lines = groupIntoLines(words);
 
+                List<Float> fontSizes = new ArrayList<>();
+                for (List<Word> line : lines) {
+                    float sz = 0;
+                    for (Word w : line) {
+                        float h = w.getBoundingBox().height * scaleY;
+                        sz = Math.max(sz, Math.max(h * 0.85f, 1f));
+                    }
+                    fontSizes.add(sz);
+                }
+                Collections.sort(fontSizes);
+                float pageFontSize = fontSizes.get(fontSizes.size() / 2);
+
                 for (List<Word> line : lines) {
                     float lineBottom = 0;
-                    float lineFontSize = 0;
-                    for (Word w : line) {
+                    for (Word w : line)
                         lineBottom = Math.max(lineBottom,
                                 (w.getBoundingBox().y + w.getBoundingBox().height) * scaleY);
-                        float h = w.getBoundingBox().height * scaleY;
-                        lineFontSize = Math.max(lineFontSize, Math.max(h * 0.85f, 1f));
-                    }
                     float pdfLineY = pageHeight - lineBottom;
 
                     for (Word word : line) {
@@ -424,15 +432,15 @@ public class Main {
                         float pdfWidth = bbox.width * scaleX;
 
                         try {
-                            float textWidth = font.getStringWidth(text) / 1000f * lineFontSize;
+                            float textWidth = font.getStringWidth(text) / 1000f * pageFontSize;
                             if (textWidth <= 0)
                                 continue;
                             float hScale = Math.max(10f, Math.min((pdfWidth / textWidth) * 100f, 300f));
 
-                            if (lineFontSize != lastFontSize || hScale != lastHScale) {
-                                stream.setFont(font, lineFontSize);
+                            if (pageFontSize != lastFontSize || hScale != lastHScale) {
+                                stream.setFont(font, pageFontSize);
                                 stream.setHorizontalScaling(hScale);
-                                lastFontSize = lineFontSize;
+                                lastFontSize = pageFontSize;
                                 lastHScale = hScale;
                             }
 
