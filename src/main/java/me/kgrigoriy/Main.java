@@ -267,6 +267,10 @@ public class Main {
                 return;
             }
             log("Подготовка OCR");
+            if (tmpDir != null) {
+                FileUtils.deleteQuietly(tmpDir.toFile());
+                tmpDir = null;
+            }
             tmpDir = Files.createTempDirectory("gdocs2pdf");
             Path data = tmpDir.resolve("tessdata");
             Files.createDirectory(data);
@@ -313,11 +317,14 @@ public class Main {
 
                 if (link.t() == Google.Document) {
                     BufferedImage original = ImageIO.read(new ByteArrayInputStream(shot));
-                    int cropWidth = (int) (Google.DOC_WIDTH * Google.SCALE);
+                    if (original == null)
+                        throw new IOException("Ошибка декодирования скриншота на странице: " + num);
+                    int cropWidth = Math.min((int) (Google.DOC_WIDTH * Google.SCALE), original.getWidth());
                     int x = (original.getWidth() - cropWidth) / 2;
                     BufferedImage cropped = original.getSubimage(x, 0, cropWidth, original.getHeight());
                     ByteArrayOutputStream baos = new ByteArrayOutputStream();
-                    ImageIO.write(cropped, "png", baos);
+                    if (!ImageIO.write(cropped, "png", baos))
+                        throw new IOException("PNG writer недоступен");
                     shot = baos.toByteArray();
                 }
 
@@ -341,6 +348,8 @@ public class Main {
 
         private void addPage(PDDocument pdf, byte[] shot, int num, PDFont font, boolean txt) throws IOException {
             BufferedImage image = ImageIO.read(new ByteArrayInputStream(shot));
+            if (image == null)
+                throw new IOException("Ошибка декодирования скриншота на странице: " + num);
             PDImageXObject pdImg = PDImageXObject.createFromByteArray(pdf, shot, "p" + num);
             float pageWidth = pdImg.getWidth() / (float) Google.SCALE;
             float pageHeight = pdImg.getHeight() / (float) Google.SCALE;
@@ -371,45 +380,82 @@ public class Main {
                 float lastFontSize = -1f;
                 float lastHScale = -1f;
 
-                for (Word word : words) {
-                    String text = word.getText().trim();
-                    if (text.isEmpty())
-                        continue;
+                List<List<Word>> lines = groupIntoLines(words);
 
-                    Rectangle bbox = word.getBoundingBox();
-                    float pdfX = bbox.x * scaleX;
-                    float pdfY = pageHeight - (bbox.y + bbox.height) * scaleY;
-                    float pdfWidth = bbox.width * scaleX;
-                    float pdfHeight = bbox.height * scaleY;
-                    float fontSize = Math.max(pdfHeight * 0.85f, 1f);
+                for (List<Word> line : lines) {
+                    float lineBottom = 0;
+                    float lineFontSize = 0;
+                    for (Word w : line) {
+                        lineBottom = Math.max(lineBottom,
+                                (w.getBoundingBox().y + w.getBoundingBox().height) * scaleY);
+                        float h = w.getBoundingBox().height * scaleY;
+                        lineFontSize = Math.max(lineFontSize, Math.max(h * 0.85f, 1f));
+                    }
+                    float pdfLineY = pageHeight - lineBottom;
 
-                    try {
-                        float textWidth = font.getStringWidth(text) / 1000f * fontSize;
-                        if (textWidth <= 0)
+                    for (Word word : line) {
+                        String text = word.getText().trim();
+                        if (text.isEmpty())
                             continue;
 
-                        float hScale = Math.max(10f, Math.min((pdfWidth / textWidth) * 100f, 300f));
+                        Rectangle bbox = word.getBoundingBox();
+                        float pdfX = bbox.x * scaleX;
+                        float pdfWidth = bbox.width * scaleX;
 
-                        if (fontSize != lastFontSize || hScale != lastHScale) {
-                            stream.setFont(font, fontSize);
-                            stream.setHorizontalScaling(hScale);
-                            lastFontSize = fontSize;
-                            lastHScale = hScale;
-                        }
-
-                        stream.beginText();
-                        stream.newLineAtOffset(pdfX, pdfY);
                         try {
-                            stream.showText(text);
-                        } catch (Exception e) {
-                            log("OCR ошибка при обработке " + text + " на странице " + num + ": " + e);
-                        } finally {
-                            stream.endText();
+                            float textWidth = font.getStringWidth(text) / 1000f * lineFontSize;
+                            if (textWidth <= 0)
+                                continue;
+                            float hScale = Math.max(10f, Math.min((pdfWidth / textWidth) * 100f, 300f));
+
+                            if (lineFontSize != lastFontSize || hScale != lastHScale) {
+                                stream.setFont(font, lineFontSize);
+                                stream.setHorizontalScaling(hScale);
+                                lastFontSize = lineFontSize;
+                                lastHScale = hScale;
+                            }
+
+                            stream.beginText();
+                            stream.newLineAtOffset(pdfX, pdfLineY);
+                            try {
+                                stream.showText(text);
+                            } catch (Exception e) {
+                                log("OCR ошибка при обработке " + text + " на странице " + num + ": " + e);
+                            } finally {
+                                stream.endText();
+                            }
+                        } catch (Exception ignored) {
                         }
-                    } catch (Exception ignored) {
                     }
                 }
             }
+        }
+
+        private List<List<Word>> groupIntoLines(List<Word> words) {
+            List<List<Word>> lines = new ArrayList<>();
+            List<int[]> spans = new ArrayList<>();
+
+            for (Word word : words) {
+                Rectangle bbox = word.getBoundingBox();
+                boolean added = false;
+                for (int i = 0; i < lines.size(); i++) {
+                    int[] span = spans.get(i);
+                    if (bbox.y < span[1] && bbox.y + bbox.height > span[0]) {
+                        lines.get(i).add(word);
+                        span[0] = Math.min(span[0], bbox.y);
+                        span[1] = Math.max(span[1], bbox.y + bbox.height);
+                        added = true;
+                        break;
+                    }
+                }
+                if (!added) {
+                    List<Word> newLine = new ArrayList<>();
+                    newLine.add(word);
+                    lines.add(newLine);
+                    spans.add(new int[] { bbox.y, bbox.y + bbox.height });
+                }
+            }
+            return lines;
         }
 
     }
