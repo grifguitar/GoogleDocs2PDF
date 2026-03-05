@@ -330,8 +330,11 @@ public class Main {
                 log("Страница: " + num);
                 prev = shot;
 
-                if (link.t() == Google.Document)
+                if (link.t() == Google.Document) {
                     page.mouse().wheel(0, Google.DOC_SCROLL_STEP);
+                    page.waitForLoadState(LoadState.NETWORKIDLE,
+                            new Page.WaitForLoadStateOptions());
+                }
             }
             log("ВНИМАНИЕ: достигнут лимит в " + Google.MAX_PAGES + " страниц");
         }
@@ -396,8 +399,13 @@ public class Main {
 
                         stream.beginText();
                         stream.newLineAtOffset(pdfX, pdfY);
-                        stream.showText(text);
-                        stream.endText();
+                        try {
+                            stream.showText(text);
+                        } catch (Exception e) {
+                            log("OCR ошибка при обработке " + text + " на странице " + num + ": " + e);
+                        } finally {
+                            stream.endText();
+                        }
                     } catch (Exception ignored) {
                     }
                 }
