@@ -14,17 +14,20 @@ import javafx.scene.image.Image;
 import javafx.scene.layout.*;
 import javafx.stage.FileChooser;
 import javafx.stage.Stage;
+import net.sourceforge.tess4j.ITessAPI;
+import net.sourceforge.tess4j.Tesseract;
+import net.sourceforge.tess4j.Word;
 
 import org.apache.pdfbox.pdmodel.*;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
+import org.apache.pdfbox.pdmodel.font.PDFont;
+import org.apache.pdfbox.pdmodel.font.PDType0Font;
 import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
+import org.apache.pdfbox.pdmodel.graphics.state.RenderingMode;
 
+import java.awt.Rectangle;
 import java.awt.image.BufferedImage;
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.File;
-import java.io.IOException;
-import java.io.InputStream;
+import java.io.*;
 import java.nio.file.*;
 import java.util.*;
 import java.util.regex.*;
@@ -74,6 +77,9 @@ public class Main {
         private Button convertButton;
         private TextArea logArea;
         private Stage primaryStage;
+
+        private Tesseract tesseract;
+        private Path tmpDir;
 
         @Override
         public void start(Stage stage) {
@@ -142,6 +148,7 @@ public class Main {
                     try {
                         log("Тип документа: " + link.t().name());
                         ensureChromiumInstalled();
+                        ensureTesseractReady();
                         try (PDDocument pdf = new PDDocument();
                                 Playwright playwright = Playwright.create();
                                 Browser browser = playwright.chromium().launch(
@@ -222,8 +229,30 @@ public class Main {
             log("Chromium установлен");
         }
 
+        private void ensureTesseractReady() throws IOException {
+            if (tesseract != null) {
+                return;
+            }
+            log("Подготовка OCR");
+            tmpDir = Files.createTempDirectory("gdocs2pdf");
+            Path data = tmpDir.resolve("tessdata");
+            Files.createDirectory(data);
+            Files.copy(getClass().getResourceAsStream("/tessdata/rus.traineddata"), data.resolve("rus.traineddata"));
+            Files.copy(getClass().getResourceAsStream("/tessdata/eng.traineddata"), data.resolve("eng.traineddata"));
+            Files.copy(getClass().getResourceAsStream("/tessdata/osd.traineddata"), data.resolve("osd.traineddata"));
+            log("OCR загружен");
+            tesseract = new Tesseract();
+            tesseract.setDatapath(data.toAbsolutePath().toString());
+            tesseract.setLanguage("rus+eng");
+            tesseract.setPageSegMode(1);
+            tesseract.setOcrEngineMode(1);
+            tesseract.setVariable("user_defined_dpi", String.valueOf((int) (96 * Google.SCALE)));
+            log("OCR готов");
+        }
+
         private void parsePage(Page page, Link link, PDDocument pdf) throws IOException {
             page.setViewportSize(link.t().width, link.t().height);
+            PDFont ocrFont = loadEmbeddedFont(pdf);
             byte[] prev = null;
             for (int num = 1; num <= Google.MAX_PAGES; num++) {
                 if (link.t() == Google.Presentation || num == 1) {
@@ -250,20 +279,62 @@ public class Main {
                     log("Страниц всего: " + (num - 1));
                     return;
                 }
-                PDImageXObject img = PDImageXObject.createFromByteArray(pdf, shot, "p" + num);
-                float w = img.getWidth() / (float) Google.SCALE;
-                float h = img.getHeight() / (float) Google.SCALE;
-                PDPage pdfPage = new PDPage(new PDRectangle(w, h));
-                pdf.addPage(pdfPage);
-                try (PDPageContentStream cs = new PDPageContentStream(pdf, pdfPage)) {
-                    cs.drawImage(img, 0, 0, w, h);
-                }
+                addPageWithOCR(pdf, shot, num, ocrFont);
                 log("Страница: " + num);
                 prev = shot;
                 if (link.t() == Google.Document)
                     page.mouse().wheel(0, Google.DOC_SCROLL_STEP);
             }
             log("ВНИМАНИЕ: достигнут лимит в " + Google.MAX_PAGES + " страниц");
+        }
+
+        private void addPageWithOCR(PDDocument pdf, byte[] imageBytes, int pageNum, PDFont ocrFont) throws IOException {
+            BufferedImage image = ImageIO.read(new ByteArrayInputStream(imageBytes));
+            PDImageXObject pdImg = PDImageXObject.createFromByteArray(pdf, imageBytes, "p" + pageNum);
+            float pageWidth = pdImg.getWidth() / (float) Google.SCALE;
+            float pageHeight = pdImg.getHeight() / (float) Google.SCALE;
+            PDPage pdfPage = new PDPage(new PDRectangle(pageWidth, pageHeight));
+            pdf.addPage(pdfPage);
+            try (PDPageContentStream stream = new PDPageContentStream(pdf, pdfPage)) {
+                stream.drawImage(pdImg, 0, 0, pageWidth, pageHeight);
+                if (tesseract == null)
+                    return;
+                List<Word> words = tesseract.getWords(image, ITessAPI.TessPageIteratorLevel.RIL_WORD);
+                if (words == null || words.isEmpty())
+                    return;
+                stream.setRenderingMode(RenderingMode.NEITHER);
+                float scaleX = pageWidth / image.getWidth();
+                float scaleY = pageHeight / image.getHeight();
+                for (Word word : words) {
+                    String text = word.getText().trim();
+                    if (text.isEmpty())
+                        continue;
+                    Rectangle bbox = word.getBoundingBox();
+                    float pdfX = bbox.x * scaleX;
+                    float pdfY = pageHeight - (bbox.y + bbox.height) * scaleY;
+                    float pdfWidth = bbox.width * scaleX;
+                    float pdfHeight = bbox.height * scaleY;
+                    float fontSize = Math.max(pdfHeight * 0.85f, 1f);
+                    try {
+                        float textWidth = ocrFont.getStringWidth(text) / 1000f * fontSize;
+                        if (textWidth <= 0)
+                            continue;
+                        float hScale = (pdfWidth / textWidth) * 100f;
+                        hScale = Math.max(10f, Math.min(hScale, 300f));
+                        stream.beginText();
+                        stream.setFont(ocrFont, fontSize);
+                        stream.setHorizontalScaling(hScale);
+                        stream.newLineAtOffset(pdfX, pdfY);
+                        stream.showText(text);
+                        stream.endText();
+                    } catch (Exception ignored) {
+                    }
+                }
+            }
+        }
+
+        private PDFont loadEmbeddedFont(PDDocument pdf) throws IOException {
+            return PDType0Font.load(pdf, getClass().getResourceAsStream("/fonts/DejaVuSans.ttf"));
         }
     }
 
