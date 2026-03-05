@@ -79,6 +79,7 @@ public class Main {
         private TextField urlField;
         private TextField outputField;
         private Button convertButton;
+        private CheckBox ocrCheckBox;
         private TextArea logArea;
         private Stage primaryStage;
 
@@ -124,6 +125,9 @@ public class Main {
             HBox outRow = new HBox(8, outLabel, outputField, browseBtn);
             outRow.setAlignment(Pos.CENTER_LEFT);
 
+            ocrCheckBox = new CheckBox("OCR");
+            ocrCheckBox.setSelected(true);
+
             convertButton = new Button("Конвертировать");
             convertButton.setDefaultButton(true);
             convertButton.setOnAction(e -> {
@@ -153,6 +157,8 @@ public class Main {
                 if (!outputRaw.equals(outputPath))
                     Platform.runLater(() -> outputField.setText(outputPath));
 
+                final boolean useOcr = ocrCheckBox.isSelected();
+
                 convertButton.setDisable(true);
                 logArea.clear();
 
@@ -160,7 +166,8 @@ public class Main {
                     try {
                         log("Тип документа: " + link.t().name());
                         ensureChromiumInstalled();
-                        ensureTesseractReady();
+                        if (useOcr)
+                            ensureTesseractReady();
                         try (PDDocument pdf = new PDDocument();
                                 Playwright playwright = Playwright.create();
                                 Browser browser = playwright.chromium().launch(
@@ -168,7 +175,7 @@ public class Main {
                                 BrowserContext ctx = browser.newContext(
                                         new Browser.NewContextOptions().setDeviceScaleFactor(Google.SCALE));
                                 Page page = ctx.newPage()) {
-                            parsePage(page, link, pdf);
+                            parsePage(page, link, pdf, useOcr);
                             pdf.save(outputPath);
                             log("PDF сохранён: " + outputPath);
                         }
@@ -182,7 +189,7 @@ public class Main {
                 thread.start();
 
             });
-            HBox btnRow = new HBox(convertButton);
+            HBox btnRow = new HBox(12, ocrCheckBox, convertButton);
             btnRow.setAlignment(Pos.CENTER_RIGHT);
 
             logArea = new TextArea();
@@ -273,13 +280,16 @@ public class Main {
             log("OCR готов");
         }
 
-        private void parsePage(Page page, Link link, PDDocument pdf) throws IOException {
+        private void parsePage(Page page, Link link, PDDocument pdf, boolean useOcr) throws IOException {
             page.setViewportSize(link.t().width, link.t().height);
 
-            InputStream is = getClass().getResourceAsStream("/fonts/DejaVuSans.ttf");
-            if (is == null)
-                throw new IOException("Отсутствует: /fonts/DejaVuSans.ttf");
-            PDFont ocrFont = PDType0Font.load(pdf, is);
+            PDFont ocrFont = null;
+            if (useOcr) {
+                InputStream is = getClass().getResourceAsStream("/fonts/DejaVuSans.ttf");
+                if (is == null)
+                    throw new IOException("Отсутствует: /fonts/DejaVuSans.ttf");
+                ocrFont = PDType0Font.load(pdf, is);
+            }
 
             byte[] prev = null;
 
@@ -310,7 +320,7 @@ public class Main {
                     return;
                 }
 
-                addPageWithOCR(pdf, shot, num, ocrFont);
+                addPage(pdf, shot, num, ocrFont);
                 log("Страница: " + num);
                 prev = shot;
 
@@ -320,7 +330,7 @@ public class Main {
             log("ВНИМАНИЕ: достигнут лимит в " + Google.MAX_PAGES + " страниц");
         }
 
-        private void addPageWithOCR(PDDocument pdf, byte[] shot, int num, PDFont font) throws IOException {
+        private void addPage(PDDocument pdf, byte[] shot, int num, PDFont ocrFont) throws IOException {
             BufferedImage image = ImageIO.read(new ByteArrayInputStream(shot));
             PDImageXObject pdImg = PDImageXObject.createFromByteArray(pdf, shot, "p" + num);
             float pageWidth = pdImg.getWidth() / (float) Google.SCALE;
@@ -330,10 +340,17 @@ public class Main {
 
             try (PDPageContentStream stream = new PDPageContentStream(pdf, pdfPage)) {
                 stream.drawImage(pdImg, 0, 0, pageWidth, pageHeight);
-                if (tesseract == null)
+
+                if (ocrFont == null || tesseract == null)
                     return;
 
-                List<Word> words = tesseract.getWords(image, ITessAPI.TessPageIteratorLevel.RIL_WORD);
+                List<Word> words;
+                try {
+                    words = tesseract.getWords(image, ITessAPI.TessPageIteratorLevel.RIL_WORD);
+                } catch (Exception e) {
+                    log("OCR ошибка на странице " + num + ": " + e);
+                    return;
+                }
                 if (words == null || words.isEmpty())
                     return;
 
@@ -354,13 +371,16 @@ public class Main {
                     float fontSize = Math.max(pdfHeight * 0.85f, 1f);
 
                     try {
-                        float textWidth = font.getStringWidth(text) / 1000f * fontSize;
+                        float textWidth = ocrFont.getStringWidth(text) / 1000f * fontSize;
                         if (textWidth <= 0)
                             continue;
+
                         float hScale = Math.max(10f, Math.min((pdfWidth / textWidth) * 100f, 300f));
-                        stream.beginText();
-                        stream.setFont(font, fontSize);
+
+                        stream.setFont(ocrFont, fontSize);
                         stream.setHorizontalScaling(hScale);
+
+                        stream.beginText();
                         stream.newLineAtOffset(pdfX, pdfY);
                         stream.showText(text);
                         stream.endText();
