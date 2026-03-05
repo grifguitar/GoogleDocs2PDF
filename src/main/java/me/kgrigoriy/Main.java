@@ -19,18 +19,24 @@ import org.apache.pdfbox.pdmodel.*;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
 import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
 
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.*;
 import java.util.*;
 import java.util.regex.*;
+
+import javax.imageio.ImageIO;
 
 public class Main {
     public static void main(String[] args) {
         App.run(args);
     }
 
-    public static enum Google {
+    public enum Google {
         Presentation(1920, 1080,
                 "https://docs.google.com/presentation/d/",
                 "docs\\.google\\.com/presentation/d/([a-zA-Z0-9_-]+)"),
@@ -38,6 +44,7 @@ public class Main {
                 "https://docs.google.com/document/d/",
                 "docs\\.google\\.com/document/d/([a-zA-Z0-9_-]+)");
 
+        static final long DOC_WIDTH = 820;
         static final long DOC_SCROLL_STEP = 1133;
         static final String PREVIEW = "/preview";
         static final double SCALE = 3.0;
@@ -72,7 +79,10 @@ public class Main {
         public void start(Stage stage) {
             this.primaryStage = stage;
             stage.setTitle("GoogleDocs2PDF by KGrigoriy for Anna💕 v1.0");
-            stage.getIcons().add(new Image(getClass().getResourceAsStream("/icon.png")));
+            InputStream iconStream = getClass().getResourceAsStream("/icon.png");
+            if (iconStream != null) {
+                stage.getIcons().add(new Image(iconStream));
+            }
 
             Label urlLabel = new Label("Ссылка:");
             urlLabel.setMinWidth(80);
@@ -128,7 +138,7 @@ public class Main {
                 convertButton.setDisable(true);
                 logArea.clear();
 
-                new Thread(() -> {
+                Thread thread = new Thread(() -> {
                     try {
                         log("Тип документа: " + link.t().name());
                         ensureChromiumInstalled();
@@ -148,7 +158,9 @@ public class Main {
                     } finally {
                         Platform.runLater(() -> convertButton.setDisable(false));
                     }
-                }, "converter-thread").start();
+                }, "converter-thread");
+                thread.setDaemon(true);
+                thread.start();
 
             });
             HBox btnRow = new HBox(convertButton);
@@ -223,6 +235,17 @@ public class Main {
                 byte[] shot = page.screenshot(
                         new Page.ScreenshotOptions()
                                 .setType(ScreenshotType.PNG).setFullPage(false));
+
+                if (link.t() == Google.Document) {
+                    BufferedImage original = ImageIO.read(new ByteArrayInputStream(shot));
+                    int cropWidth = (int) (Google.DOC_WIDTH * Google.SCALE);
+                    int x = (original.getWidth() - cropWidth) / 2;
+                    BufferedImage cropped = original.getSubimage(x, 0, cropWidth, original.getHeight());
+                    ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                    ImageIO.write(cropped, "png", baos);
+                    shot = baos.toByteArray();
+                }
+
                 if (Arrays.equals(prev, shot)) {
                     log("Страниц всего: " + (num - 1));
                     return;
