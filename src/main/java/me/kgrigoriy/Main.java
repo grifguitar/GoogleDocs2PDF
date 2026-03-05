@@ -185,6 +185,9 @@ public class Main {
                             pdf.save(outputPath);
                             log("PDF сохранён: " + outputPath);
                         }
+                    } catch (InterruptedException ex) {
+                        Thread.currentThread().interrupt();
+                        log("Конвертация прервана");
                     } catch (Exception ex) {
                         log("Ошибка: " + ex);
                     } finally {
@@ -302,45 +305,63 @@ public class Main {
             }
 
             byte[] prev = null;
+            int saved = 0;
 
             for (int num = 1; num <= Google.MAX_PAGES; num++) {
-                if (link.t() == Google.Presentation || num == 1) {
-                    String anchor = (link.t() == Google.Presentation) ? "#slide=id.p" + num : "";
-                    page.navigate(link.url() + anchor);
-                    page.waitForLoadState(LoadState.NETWORKIDLE,
-                            new Page.WaitForLoadStateOptions());
-                }
+                try {
+                    if (link.t() == Google.Presentation || num == 1) {
+                        String anchor = (link.t() == Google.Presentation) ? "#slide=id.p" + num : "";
+                        page.navigate(link.url() + anchor);
+                        page.waitForLoadState(LoadState.NETWORKIDLE,
+                                new Page.WaitForLoadStateOptions());
+                    }
 
-                byte[] shot = page.screenshot(
-                        new Page.ScreenshotOptions()
-                                .setType(ScreenshotType.PNG).setFullPage(false));
+                    byte[] shot = page.screenshot(
+                            new Page.ScreenshotOptions()
+                                    .setType(ScreenshotType.PNG).setFullPage(false));
 
-                if (link.t() == Google.Document) {
-                    BufferedImage original = ImageIO.read(new ByteArrayInputStream(shot));
-                    if (original == null)
-                        throw new IOException("Ошибка декодирования скриншота на странице: " + num);
-                    int cropWidth = Math.min((int) (Google.DOC_WIDTH * Google.SCALE), original.getWidth());
-                    int x = (original.getWidth() - cropWidth) / 2;
-                    BufferedImage cropped = original.getSubimage(x, 0, cropWidth, original.getHeight());
-                    ByteArrayOutputStream baos = new ByteArrayOutputStream();
-                    if (!ImageIO.write(cropped, "png", baos))
-                        throw new IOException("PNG writer недоступен");
-                    shot = baos.toByteArray();
-                }
+                    if (link.t() == Google.Document) {
+                        BufferedImage original = ImageIO.read(new ByteArrayInputStream(shot));
+                        if (original == null)
+                            throw new IOException("Не удалось декодировать скриншот");
+                        int cropWidth = Math.min((int) (Google.DOC_WIDTH * Google.SCALE), original.getWidth());
+                        int x = Math.max(0, (original.getWidth() - cropWidth) / 2);
+                        BufferedImage cropped = original.getSubimage(x, 0, cropWidth, original.getHeight());
+                        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                        if (!ImageIO.write(cropped, "png", baos))
+                            throw new IOException("PNG writer недоступен");
+                        shot = baos.toByteArray();
+                    }
 
-                if (Arrays.equals(prev, shot)) {
-                    log("Страниц всего: " + (num - 1));
-                    return;
-                }
+                    if (Arrays.equals(prev, shot)) {
+                        log("Страниц всего: " + saved);
+                        return;
+                    }
 
-                addPage(pdf, shot, num, font, txt);
-                log("Страница: " + num);
-                prev = shot;
+                    try {
+                        addPage(pdf, shot, num, font, txt);
+                        saved++;
+                        log("Страница: " + num);
+                    } catch (Exception e) {
+                        log("Страница " + num + " пропущена: " + e);
+                    }
 
-                if (link.t() == Google.Document) {
-                    page.mouse().wheel(0, Google.DOC_SCROLL_STEP);
-                    page.waitForLoadState(LoadState.NETWORKIDLE,
-                            new Page.WaitForLoadStateOptions());
+                    prev = shot;
+
+                    if (link.t() == Google.Document) {
+                        page.mouse().wheel(0, Google.DOC_SCROLL_STEP);
+                        page.waitForLoadState(LoadState.NETWORKIDLE,
+                                new Page.WaitForLoadStateOptions());
+                    }
+
+                } catch (Exception e) {
+                    if (num == 1)
+                        throw new IOException("Ошибка загрузки первой страницы: " + e, e);
+                    log("Страница " + num + " недоступна, пропускаю: " + e);
+                    if (link.t() == Google.Presentation && prev != null) {
+                        log("Страниц всего: " + saved);
+                        return;
+                    }
                 }
             }
             log("ВНИМАНИЕ: достигнут лимит в " + Google.MAX_PAGES + " страниц");
