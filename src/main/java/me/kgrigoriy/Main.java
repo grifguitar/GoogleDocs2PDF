@@ -298,9 +298,9 @@ public class Main {
 
             PDFont font = null;
             if (ocr) {
-                InputStream is = getClass().getResourceAsStream("/fonts/DejaVuSans.ttf");
+                InputStream is = getClass().getResourceAsStream("/fonts/LiberationSans-Regular.ttf");
                 if (is == null)
-                    throw new IOException("Отсутствует: /fonts/DejaVuSans.ttf");
+                    throw new IOException("Отсутствует: /fonts/LiberationSans-Regular.ttf");
                 font = PDType0Font.load(pdf, is);
             }
 
@@ -401,51 +401,78 @@ public class Main {
                 float lastFontSize = -1f;
                 float lastHScale = -1f;
 
-                List<List<Word>> lines = groupIntoLines(words);
+                if (txt) {
+                    List<List<Word>> lines = groupIntoLines(words);
 
-                List<Float> fontSizes = new ArrayList<>();
-                for (List<Word> line : lines) {
-                    float sz = 0;
-                    for (Word w : line) {
-                        float h = w.getBoundingBox().height * scaleY;
-                        sz = Math.max(sz, Math.max(h * 0.85f, 1f));
+                    List<Float> fontSizes = new ArrayList<>();
+                    for (List<Word> line : lines) {
+                        float sz = 0;
+                        for (Word w : line) {
+                            float h = w.getBoundingBox().height * scaleY;
+                            sz = Math.max(sz, Math.max(h * 0.85f, 1f));
+                        }
+                        fontSizes.add(sz);
                     }
-                    fontSizes.add(sz);
-                }
-                Collections.sort(fontSizes);
-                float pageFontSize = fontSizes.get(fontSizes.size() / 2);
+                    Collections.sort(fontSizes);
+                    float pageFontSize = fontSizes.get(fontSizes.size() / 2);
 
-                for (List<Word> line : lines) {
-                    float lineBottom = 0;
-                    for (Word w : line)
-                        lineBottom = Math.max(lineBottom,
-                                (w.getBoundingBox().y + w.getBoundingBox().height) * scaleY);
-                    float pdfLineY = pageHeight - lineBottom;
+                    stream.setFont(font, pageFontSize);
+                    stream.setHorizontalScaling(100f);
 
-                    for (Word word : line) {
+                    for (List<Word> line : lines) {
+                        float lineBottom = 0;
+                        for (Word w : line)
+                            lineBottom = Math.max(lineBottom,
+                                    (w.getBoundingBox().y + w.getBoundingBox().height) * scaleY);
+                        float pdfLineY = pageHeight - lineBottom;
+
+                        for (Word word : line) {
+                            String text = word.getText().trim();
+                            if (text.isEmpty())
+                                continue;
+
+                            float pdfX = word.getBoundingBox().x * scaleX;
+
+                            stream.beginText();
+                            stream.newLineAtOffset(pdfX, pdfLineY);
+                            try {
+                                stream.showText(text);
+                            } catch (Exception e) {
+                                log("OCR ошибка при обработке " + text + " на странице " + num + ": " + e);
+                            } finally {
+                                stream.endText();
+                            }
+                        }
+                    }
+
+                } else {
+                    for (Word word : words) {
                         String text = word.getText().trim();
                         if (text.isEmpty())
                             continue;
 
                         Rectangle bbox = word.getBoundingBox();
                         float pdfX = bbox.x * scaleX;
+                        float pdfY = pageHeight - (bbox.y + bbox.height) * scaleY;
                         float pdfWidth = bbox.width * scaleX;
+                        float pdfHeight = bbox.height * scaleY;
+                        float fontSize = Math.max(pdfHeight * 0.85f, 1f);
 
                         try {
-                            float textWidth = font.getStringWidth(text) / 1000f * pageFontSize;
+                            float textWidth = font.getStringWidth(text) / 1000f * fontSize;
                             if (textWidth <= 0)
                                 continue;
                             float hScale = Math.max(10f, Math.min((pdfWidth / textWidth) * 100f, 300f));
 
-                            if (pageFontSize != lastFontSize || hScale != lastHScale) {
-                                stream.setFont(font, pageFontSize);
+                            if (fontSize != lastFontSize || hScale != lastHScale) {
+                                stream.setFont(font, fontSize);
                                 stream.setHorizontalScaling(hScale);
-                                lastFontSize = pageFontSize;
+                                lastFontSize = fontSize;
                                 lastHScale = hScale;
                             }
 
                             stream.beginText();
-                            stream.newLineAtOffset(pdfX, pdfLineY);
+                            stream.newLineAtOffset(pdfX, pdfY);
                             try {
                                 stream.showText(text);
                             } catch (Exception e) {
