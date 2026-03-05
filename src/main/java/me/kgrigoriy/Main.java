@@ -14,10 +14,12 @@ import javafx.scene.image.Image;
 import javafx.scene.layout.*;
 import javafx.stage.FileChooser;
 import javafx.stage.Stage;
+
 import net.sourceforge.tess4j.ITessAPI;
 import net.sourceforge.tess4j.Tesseract;
 import net.sourceforge.tess4j.Word;
 
+import org.apache.commons.io.FileUtils;
 import org.apache.pdfbox.pdmodel.*;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
 import org.apache.pdfbox.pdmodel.font.PDFont;
@@ -35,6 +37,7 @@ import java.util.regex.*;
 import javax.imageio.ImageIO;
 
 public class Main {
+
     public static void main(String[] args) {
         App.run(args);
     }
@@ -47,8 +50,8 @@ public class Main {
                 "https://docs.google.com/document/d/",
                 "docs\\.google\\.com/document/d/([a-zA-Z0-9_-]+)");
 
-        static final long DOC_WIDTH = 820;
-        static final long DOC_SCROLL_STEP = 1133;
+        static final int DOC_WIDTH = 820;
+        static final int DOC_SCROLL_STEP = 1133;
         static final String PREVIEW = "/preview";
         static final double SCALE = 3.0;
         static final int MAX_PAGES = 1000;
@@ -68,6 +71,7 @@ public class Main {
     }
 
     public static class App extends Application {
+
         public static void run(String[] args) {
             launch(args);
         }
@@ -85,6 +89,7 @@ public class Main {
         public void start(Stage stage) {
             this.primaryStage = stage;
             stage.setTitle("GoogleDocs2PDF by KGrigoriy for Anna💕 v1.0");
+
             InputStream iconStream = getClass().getResourceAsStream("/icon.png");
             if (iconStream != null) {
                 stage.getIcons().add(new Image(iconStream));
@@ -124,13 +129,13 @@ public class Main {
             convertButton.setOnAction(e -> {
 
                 String rawUrl = urlField.getText().trim();
-                String outputPath = outputField.getText().trim();
+                String outputRaw = outputField.getText().trim();
 
                 if (rawUrl.isEmpty()) {
                     log("Введите ссылку");
                     return;
                 }
-                if (outputPath.isEmpty()) {
+                if (outputRaw.isEmpty()) {
                     log("Введите имя файла для сохранения");
                     return;
                 }
@@ -140,6 +145,13 @@ public class Main {
                     log("Некорректная ссылка: поддерживаются Google Slides и Google Docs");
                     return;
                 }
+
+                final String outputPath = outputRaw.toLowerCase().endsWith(".pdf")
+                        ? outputRaw
+                        : outputRaw + ".pdf";
+
+                if (!outputRaw.equals(outputPath))
+                    Platform.runLater(() -> outputField.setText(outputPath));
 
                 convertButton.setDisable(true);
                 logArea.clear();
@@ -189,6 +201,12 @@ public class Main {
             stage.show();
         }
 
+        @Override
+        public void stop() {
+            if (tmpDir != null)
+                FileUtils.deleteQuietly(tmpDir.toFile());
+        }
+
         private void log(String msg) {
             Platform.runLater(() -> logArea.appendText(msg + "\n"));
         }
@@ -196,10 +214,12 @@ public class Main {
         private Link parseLink(String link) {
             Matcher slides = Pattern.compile(Google.Presentation.regex).matcher(link);
             if (slides.find())
-                return new Link(Google.Presentation, Google.Presentation.prefix + slides.group(1) + Google.PREVIEW);
+                return new Link(Google.Presentation,
+                        Google.Presentation.prefix + slides.group(1) + Google.PREVIEW);
             Matcher docs = Pattern.compile(Google.Document.regex).matcher(link);
             if (docs.find())
-                return new Link(Google.Document, Google.Document.prefix + docs.group(1) + Google.PREVIEW);
+                return new Link(Google.Document,
+                        Google.Document.prefix + docs.group(1) + Google.PREVIEW);
             return null;
         }
 
@@ -237,9 +257,12 @@ public class Main {
             tmpDir = Files.createTempDirectory("gdocs2pdf");
             Path data = tmpDir.resolve("tessdata");
             Files.createDirectory(data);
-            Files.copy(getClass().getResourceAsStream("/tessdata/rus.traineddata"), data.resolve("rus.traineddata"));
-            Files.copy(getClass().getResourceAsStream("/tessdata/eng.traineddata"), data.resolve("eng.traineddata"));
-            Files.copy(getClass().getResourceAsStream("/tessdata/osd.traineddata"), data.resolve("osd.traineddata"));
+            for (String f : List.of("rus.traineddata", "eng.traineddata", "osd.traineddata")) {
+                InputStream is = getClass().getResourceAsStream("/tessdata/" + f);
+                if (is == null)
+                    throw new IOException("Отсутствует: /tessdata/" + f);
+                Files.copy(is, data.resolve(f));
+            }
             log("OCR загружен");
             tesseract = new Tesseract();
             tesseract.setDatapath(data.toAbsolutePath().toString());
@@ -252,8 +275,14 @@ public class Main {
 
         private void parsePage(Page page, Link link, PDDocument pdf) throws IOException {
             page.setViewportSize(link.t().width, link.t().height);
-            PDFont ocrFont = loadEmbeddedFont(pdf);
+
+            InputStream is = getClass().getResourceAsStream("/fonts/DejaVuSans.ttf");
+            if (is == null)
+                throw new IOException("Отсутствует: /fonts/DejaVuSans.ttf");
+            PDFont ocrFont = PDType0Font.load(pdf, is);
+
             byte[] prev = null;
+
             for (int num = 1; num <= Google.MAX_PAGES; num++) {
                 if (link.t() == Google.Presentation || num == 1) {
                     String anchor = (link.t() == Google.Presentation) ? "#slide=id.p" + num : "";
@@ -261,6 +290,7 @@ public class Main {
                     page.waitForLoadState(LoadState.NETWORKIDLE,
                             new Page.WaitForLoadStateOptions());
                 }
+
                 byte[] shot = page.screenshot(
                         new Page.ScreenshotOptions()
                                 .setType(ScreenshotType.PNG).setFullPage(false));
@@ -279,50 +309,57 @@ public class Main {
                     log("Страниц всего: " + (num - 1));
                     return;
                 }
+
                 addPageWithOCR(pdf, shot, num, ocrFont);
                 log("Страница: " + num);
                 prev = shot;
+
                 if (link.t() == Google.Document)
                     page.mouse().wheel(0, Google.DOC_SCROLL_STEP);
             }
             log("ВНИМАНИЕ: достигнут лимит в " + Google.MAX_PAGES + " страниц");
         }
 
-        private void addPageWithOCR(PDDocument pdf, byte[] imageBytes, int pageNum, PDFont ocrFont) throws IOException {
-            BufferedImage image = ImageIO.read(new ByteArrayInputStream(imageBytes));
-            PDImageXObject pdImg = PDImageXObject.createFromByteArray(pdf, imageBytes, "p" + pageNum);
+        private void addPageWithOCR(PDDocument pdf, byte[] shot, int num, PDFont font) throws IOException {
+            BufferedImage image = ImageIO.read(new ByteArrayInputStream(shot));
+            PDImageXObject pdImg = PDImageXObject.createFromByteArray(pdf, shot, "p" + num);
             float pageWidth = pdImg.getWidth() / (float) Google.SCALE;
             float pageHeight = pdImg.getHeight() / (float) Google.SCALE;
             PDPage pdfPage = new PDPage(new PDRectangle(pageWidth, pageHeight));
             pdf.addPage(pdfPage);
+
             try (PDPageContentStream stream = new PDPageContentStream(pdf, pdfPage)) {
                 stream.drawImage(pdImg, 0, 0, pageWidth, pageHeight);
                 if (tesseract == null)
                     return;
+
                 List<Word> words = tesseract.getWords(image, ITessAPI.TessPageIteratorLevel.RIL_WORD);
                 if (words == null || words.isEmpty())
                     return;
+
                 stream.setRenderingMode(RenderingMode.NEITHER);
                 float scaleX = pageWidth / image.getWidth();
                 float scaleY = pageHeight / image.getHeight();
+
                 for (Word word : words) {
                     String text = word.getText().trim();
                     if (text.isEmpty())
                         continue;
+
                     Rectangle bbox = word.getBoundingBox();
                     float pdfX = bbox.x * scaleX;
                     float pdfY = pageHeight - (bbox.y + bbox.height) * scaleY;
                     float pdfWidth = bbox.width * scaleX;
                     float pdfHeight = bbox.height * scaleY;
                     float fontSize = Math.max(pdfHeight * 0.85f, 1f);
+
                     try {
-                        float textWidth = ocrFont.getStringWidth(text) / 1000f * fontSize;
+                        float textWidth = font.getStringWidth(text) / 1000f * fontSize;
                         if (textWidth <= 0)
                             continue;
-                        float hScale = (pdfWidth / textWidth) * 100f;
-                        hScale = Math.max(10f, Math.min(hScale, 300f));
+                        float hScale = Math.max(10f, Math.min((pdfWidth / textWidth) * 100f, 300f));
                         stream.beginText();
-                        stream.setFont(ocrFont, fontSize);
+                        stream.setFont(font, fontSize);
                         stream.setHorizontalScaling(hScale);
                         stream.newLineAtOffset(pdfX, pdfY);
                         stream.showText(text);
@@ -333,9 +370,6 @@ public class Main {
             }
         }
 
-        private PDFont loadEmbeddedFont(PDDocument pdf) throws IOException {
-            return PDType0Font.load(pdf, getClass().getResourceAsStream("/fonts/DejaVuSans.ttf"));
-        }
     }
 
 }
