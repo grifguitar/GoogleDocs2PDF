@@ -39,6 +39,8 @@ import javax.imageio.ImageIO;
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
 import org.jsoup.nodes.Element;
+import org.jsoup.nodes.Node;
+import org.jsoup.nodes.TextNode;
 import org.jsoup.select.Elements;
 
 public class Main {
@@ -108,7 +110,7 @@ public class Main {
             Label urlLabel = new Label("Ссылка:");
             urlLabel.setMinWidth(80);
             urlField = new TextField();
-            urlField.setPromptText("https://docs.google.com/");
+            urlField.setPromptText("https://docs.google.com/link");
             HBox.setHgrow(urlField, Priority.ALWAYS);
             HBox urlRow = new HBox(8, urlLabel, urlField);
             urlRow.setAlignment(Pos.CENTER_LEFT);
@@ -116,16 +118,16 @@ public class Main {
             Label outLabel = new Label("Сохранить:");
             outLabel.setMinWidth(80);
             outputField = new TextField();
-            outputField.setPromptText("output.pdf");
+            outputField.setPromptText("file");
             HBox.setHgrow(outputField, Priority.ALWAYS);
             Button browseBtn = new Button("Обзор");
             browseBtn.setOnAction(e -> {
 
                 FileChooser fc = new FileChooser();
-                fc.setTitle("Сохранить PDF как");
+                fc.setTitle("Сохранить как");
                 fc.getExtensionFilters().add(
-                        new FileChooser.ExtensionFilter("PDF файлы", "*.pdf"));
-                fc.setInitialFileName("output.pdf");
+                        new FileChooser.ExtensionFilter("Файлы", "*.*"));
+                fc.setInitialFileName("file");
                 File file = fc.showSaveDialog(primaryStage);
                 if (file != null)
                     outputField.setText(file.getAbsolutePath());
@@ -174,16 +176,16 @@ public class Main {
                     return;
                 }
 
-                final String outputPath = outputRaw.toLowerCase().endsWith(".pdf")
-                        ? outputRaw
-                        : outputRaw + ".pdf";
-
-                if (!outputRaw.equals(outputPath))
-                    Platform.runLater(() -> outputField.setText(outputPath));
-
                 final boolean useOcr = ocrCheckBox.isSelected();
                 final boolean onlyText = onlyTextCheckBox.isSelected() && useOcr;
                 final boolean useMobileHtml = mobileHtmlCheckBox.isSelected();
+
+                final String outputPath = (!useMobileHtml)
+                        ? (outputRaw.toLowerCase().endsWith(".pdf") ? outputRaw : outputRaw + ".pdf")
+                        : (outputRaw.toLowerCase().endsWith(".html") ? outputRaw : outputRaw + ".html");
+
+                if (!outputRaw.equals(outputPath))
+                    Platform.runLater(() -> outputField.setText(outputPath));
 
                 convertButton.setDisable(true);
                 logArea.clear();
@@ -194,28 +196,23 @@ public class Main {
 
                         if (useMobileHtml) {
                             log("Режим: Mobile/HTML");
+                            try (FileWriter out = new FileWriter(outputPath)) {
+                                parseSinglePageHtmlMode(link, out);
+                            }
+                            log("HTML сохранён: " + outputPath);
                         } else {
                             log("Режим: Скриншоты" + (useOcr ? " + OCR" : ""));
-                        }
+                            ensureChromiumInstalled();
+                            if (useOcr)
+                                ensureTesseractReady();
+                            try (PDDocument pdf = new PDDocument();
+                                    Playwright playwright = Playwright.create();
+                                    Browser browser = playwright.chromium().launch(
+                                            new BrowserType.LaunchOptions().setHeadless(true));
+                                    BrowserContext ctx = browser.newContext(
+                                            new Browser.NewContextOptions().setDeviceScaleFactor(Google.SCALE));
+                                    Page page = ctx.newPage()) {
 
-                        ensureChromiumInstalled();
-                        if (useOcr && !useMobileHtml)
-                            ensureTesseractReady();
-                        try (PDDocument pdf = new PDDocument();
-                                Playwright playwright = Playwright.create();
-                                Browser browser = playwright.chromium().launch(
-                                        new BrowserType.LaunchOptions().setHeadless(true));
-                                BrowserContext ctx = browser.newContext(
-                                        new Browser.NewContextOptions().setDeviceScaleFactor(Google.SCALE));
-                                Page page = ctx.newPage()) {
-
-                            if (useMobileHtml) {
-                                String filename = outputPath.replaceAll(".pdf", ".html");
-                                try (FileWriter out = new FileWriter(filename)) {
-                                    parseSinglePageHtmlMode(page, link, out);
-                                }
-                                log("HTML сохранён: " + filename);
-                            } else {
                                 parsePage(page, link, pdf, useOcr, onlyText);
                                 pdf.save(outputPath);
                                 log("PDF сохранён: " + outputPath);
@@ -283,7 +280,7 @@ public class Main {
             return null;
         }
 
-        private void parseSinglePageHtmlMode(Page page, Link link, FileWriter out) throws IOException {
+        private void parseSinglePageHtmlMode(Link link, FileWriter out) throws IOException {
             log("HTML: " + link.url());
             Document doc = Jsoup.connect(link.url())
                     .userAgent(
@@ -292,59 +289,274 @@ public class Main {
                                     + "Chrome/120.0.0.0 Mobile Safari/537.36")
                     .timeout(30_000)
                     .get();
-            out.append("<!DOCTYPE html><html><head><meta charset='UTF-8'><title>")
-                    .append(doc.title().trim().isEmpty() ? "Документ" : doc.title().trim())
-                    .append("</title></head><body>");
-            Elements all = doc.select("h1,h2,h3,h4,h5,h6,p,li,table");
-            for (Element el : all) {
-                String tag = el.tagName().toLowerCase();
-                String text = el.text().trim();
-                if (text.isEmpty())
-                    continue;
-                if ("table".equals(tag)) {
-                    renderSimpleTable(el, out);
-                } else if (tag.matches("h[1-6]")) {
-                    String level = Integer.toString(tag.charAt(1) - '0');
-                    out.append("<h").append(level).append(">").append(text)
-                            .append("</h").append(level).append(">\n");
-                } else if ("li".equals(tag)) {
-                    out.append("<ul><li>").append(text).append("</li></ul>\n");
-                } else {
-                    out.append("<p>").append(text).append("</p>\n");
-                }
-            }
+
+            String title = doc.title().trim().isEmpty() ? "Документ" : doc.title().trim();
+            out.append("<!DOCTYPE html><html><head>")
+                    .append("<meta charset='UTF-8'>")
+                    .append("<title>").append(escapeHtml(title)).append("</title>")
+                    .append("</head><body>\n");
+
+            renderNode(doc.body(), out);
+
             out.append("</body></html>");
         }
 
-        private static void renderSimpleTable(Element table, FileWriter out) throws IOException {
-            out.append("<table border='1'>\n");
-            Elements rows = table.select("tr");
-            if (!rows.isEmpty()) {
-                for (Element row : rows) {
-                    out.append("<tr>");
-                    row.select("td,th").forEach(cell -> {
-                        try {
-                            out.append("<").append(cell.tagName()).append(">")
-                                    .append(cell.text().trim()).append("</").append(cell.tagName()).append(">");
-                        } catch (IOException e) {
-                        }
-                    });
-                    out.append("</tr>\n");
+        private void renderNode(Node node, FileWriter out) throws IOException {
+            if (node instanceof TextNode) {
+                String text = ((TextNode) node).text();
+                if (!text.isBlank()) {
+                    out.append(escapeHtml(text));
                 }
-            } else {
-                Elements cells = table.select("td,th");
-                if (!cells.isEmpty()) {
-                    out.append("<tr>");
-                    cells.forEach(cell -> {
-                        try {
-                            out.append("<td>").append(cell.text().trim()).append("</td>");
-                        } catch (IOException e) {
+                return;
+            }
+
+            if (!(node instanceof Element))
+                return;
+
+            Element el = (Element) node;
+            String tag = el.tagName().toLowerCase();
+
+            switch (tag) {
+                case "h1":
+                case "h2":
+                case "h3":
+                case "h4":
+                case "h5":
+                case "h6":
+                    out.append("<").append(tag).append(">");
+                    renderInlineContent(el, out);
+                    out.append("</").append(tag).append(">\n");
+                    break;
+
+                case "p":
+                    out.append("<p>");
+                    renderInlineContent(el, out);
+                    out.append("</p>\n");
+                    break;
+
+                case "div":
+                case "section":
+                case "article":
+                case "main":
+                case "aside":
+                case "header":
+                case "footer":
+                case "nav":
+                case "form":
+                    if (!el.ownText().isBlank()) {
+                        out.append("<p>");
+                        renderInlineContent(el, out);
+                        out.append("</p>\n");
+                    } else {
+                        for (Node child : el.childNodes()) {
+                            renderNode(child, out);
                         }
-                    });
-                    out.append("</tr>\n");
+                    }
+                    break;
+
+                case "ul":
+                    out.append("<ul>\n");
+                    for (Node child : el.childNodes())
+                        renderNode(child, out);
+                    out.append("</ul>\n");
+                    break;
+
+                case "ol":
+                    out.append("<ol>\n");
+                    for (Node child : el.childNodes())
+                        renderNode(child, out);
+                    out.append("</ol>\n");
+                    break;
+
+                case "li":
+                    out.append("<li>");
+                    renderInlineContent(el, out);
+                    for (Element nested : el.select("> ul, > ol")) {
+                        renderNode(nested, out);
+                    }
+                    out.append("</li>\n");
+                    break;
+
+                case "table":
+                    renderTable(el, out);
+                    break;
+
+                case "br":
+                    out.append("<br>\n");
+                    break;
+
+                case "hr":
+                    out.append("<hr>\n");
+                    break;
+
+                case "pre":
+                case "code":
+                    out.append("<").append(tag).append(">")
+                            .append(escapeHtml(el.wholeText()))
+                            .append("</").append(tag).append(">\n");
+                    break;
+
+                case "blockquote":
+                    out.append("<blockquote>");
+                    renderInlineContent(el, out);
+                    out.append("</blockquote>\n");
+                    break;
+
+                default:
+                    for (Node child : el.childNodes()) {
+                        renderNode(child, out);
+                    }
+                    break;
+            }
+        }
+
+        private void renderInlineContent(Element parent, FileWriter out) throws IOException {
+            for (Node node : parent.childNodes()) {
+                if (node instanceof TextNode) {
+                    String text = ((TextNode) node).text();
+                    if (!text.isEmpty()) {
+                        out.append(escapeHtml(text));
+                    }
+                } else if (node instanceof Element) {
+                    Element el = (Element) node;
+                    String tag = el.tagName().toLowerCase();
+
+                    switch (tag) {
+                        case "b":
+                        case "strong":
+                            out.append("<b>");
+                            renderInlineContent(el, out);
+                            out.append("</b>");
+                            break;
+                        case "i":
+                        case "em":
+                            out.append("<i>");
+                            renderInlineContent(el, out);
+                            out.append("</i>");
+                            break;
+                        case "u":
+                            out.append("<u>");
+                            renderInlineContent(el, out);
+                            out.append("</u>");
+                            break;
+                        case "s":
+                        case "strike":
+                        case "del":
+                            out.append("<s>");
+                            renderInlineContent(el, out);
+                            out.append("</s>");
+                            break;
+                        case "sup":
+                            out.append("<sup>");
+                            renderInlineContent(el, out);
+                            out.append("</sup>");
+                            break;
+                        case "sub":
+                            out.append("<sub>");
+                            renderInlineContent(el, out);
+                            out.append("</sub>");
+                            break;
+                        case "a":
+                            String href = el.attr("abs:href");
+                            if (href.isEmpty())
+                                href = el.attr("href");
+                            out.append("<a href='").append(escapeHtml(href)).append("'>");
+                            renderInlineContent(el, out);
+                            out.append("</a>");
+                            break;
+                        case "br":
+                            out.append("<br>\n");
+                            break;
+                        case "span":
+                        case "font":
+                        case "label":
+                            String style = el.attr("style");
+                            boolean isBold = isCssBold(el, style);
+                            boolean isItalic = isCssItalic(el, style);
+                            if (isBold)
+                                out.append("<b>");
+                            if (isItalic)
+                                out.append("<i>");
+                            renderInlineContent(el, out);
+                            if (isItalic)
+                                out.append("</i>");
+                            if (isBold)
+                                out.append("</b>");
+                            break;
+                        case "code":
+                            out.append("<code>")
+                                    .append(escapeHtml(el.text()))
+                                    .append("</code>");
+                            break;
+                        default:
+                            renderInlineContent(el, out);
+                            break;
+                    }
                 }
             }
+        }
+
+        private boolean isCssBold(Element el, String style) {
+            if (style == null || style.isEmpty())
+                return false;
+            if (style.matches("(?i).*font-weight\\s*:\\s*(bold|bolder).*"))
+                return true;
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("(?i)font-weight\\s*:\\s*(\\d+)")
+                    .matcher(style);
+            if (m.find()) {
+                int weight = Integer.parseInt(m.group(1));
+                return weight >= 700;
+            }
+            return false;
+        }
+
+        private boolean isCssItalic(Element el, String style) {
+            if (style == null || style.isEmpty())
+                return false;
+            return style.matches("(?i).*font-style\\s*:\\s*(italic|oblique).*");
+        }
+
+        private void renderTable(Element table, FileWriter out) throws IOException {
+            out.append("<table border='1'>\n");
+            Elements rows = table.select("tr");
+            for (Element row : rows) {
+                if (!row.parents().first().closest("table").equals(table))
+                    continue;
+
+                out.append("  <tr>");
+                for (Element cell : row.select("td, th")) {
+                    String cellTag = cell.tagName();
+                    StringBuilder attrs = new StringBuilder();
+                    String colspan = cell.attr("colspan");
+                    String rowspan = cell.attr("rowspan");
+                    if (!colspan.isEmpty() && !colspan.equals("1"))
+                        attrs.append(" colspan='").append(escapeHtml(colspan)).append("'");
+                    if (!rowspan.isEmpty() && !rowspan.equals("1"))
+                        attrs.append(" rowspan='").append(escapeHtml(rowspan)).append("'");
+
+                    out.append("<").append(cellTag).append(attrs).append(">");
+                    if (cell.text().trim().isEmpty()) {
+                        out.append("&nbsp;");
+                    } else {
+                        renderInlineContent(cell, out);
+                    }
+                    out.append("</").append(cellTag).append(">");
+                }
+                out.append("</tr>\n");
+            }
             out.append("</table>\n");
+        }
+
+        private static String escapeHtml(String text) {
+            if (text == null)
+                return "";
+            return text
+                    .replace("&", "&amp;")
+                    .replace("<", "&lt;")
+                    .replace(">", "&gt;")
+                    .replace("\"", "&quot;")
+                    .replace("'", "&#39;");
         }
 
         private Path getCachePath() {
@@ -494,7 +706,8 @@ public class Main {
 
                 List<Word> lines;
                 try {
-                    lines = tesseract.getWords(image, ITessAPI.TessPageIteratorLevel.RIL_TEXTLINE);
+                    lines = tesseract.getWords(image, txt ? ITessAPI.TessPageIteratorLevel.RIL_TEXTLINE
+                            : ITessAPI.TessPageIteratorLevel.RIL_WORD);
                 } catch (Exception e) {
                     log("OCR ошибка на странице " + num + ": " + e);
                     return;
@@ -520,32 +733,51 @@ public class Main {
                     Rectangle bbox = line.getBoundingBox();
 
                     float pdfX = bbox.x * scaleX;
-                    float pdfY = pageHeight - (bbox.y + bbox.height) * scaleY;
-                    float baseHeight = bbox.height * scaleY * 0.85f;
+                    float fontSize, pdfY, horizScaling;
 
-                    recentSizes.add(baseHeight);
-                    if (recentSizes.size() > 5) {
-                        recentSizes.remove(0);
+                    if (!txt) {
+                        float boxWidth = bbox.width * scaleX;
+                        float boxHeight = bbox.height * scaleY;
+                        fontSize = Math.max(boxHeight * 0.85f, 4f);
+                        pdfY = pageHeight - (bbox.y + bbox.height) * scaleY + boxHeight * 0.15f;
+                        float textWidth;
+                        try {
+                            textWidth = font.getStringWidth(text) / 1000f * fontSize;
+                        } catch (Exception e) {
+                            log("OCR: невозможно измерить ширину \"" + text + "\": " + e);
+                            continue;
+                        }
+                        if (textWidth <= 0)
+                            continue;
+                        horizScaling = (boxWidth / textWidth) * 100f;
+                    } else {
+                        pdfY = pageHeight - (bbox.y + bbox.height) * scaleY;
+                        float baseHeight = bbox.height * scaleY * 0.85f;
+                        recentSizes.add(baseHeight);
+                        if (recentSizes.size() > 5) {
+                            recentSizes.remove(0);
+                        }
+                        float sum = 0f;
+                        for (Float s : recentSizes) {
+                            sum += s;
+                        }
+                        fontSize = sum / recentSizes.size();
+                        fontSize = Math.max(fontSize, 8f);
+                        horizScaling = 100f;
                     }
-                    float sum = 0f;
-                    for (Float s : recentSizes) {
-                        sum += s;
-                    }
-                    float smoothedSize = sum / recentSizes.size();
-                    smoothedSize = Math.max(smoothedSize, 8f);
-
-                    stream.setFont(font, smoothedSize);
-
+                    stream.setFont(font, fontSize);
+                    stream.setHorizontalScaling(horizScaling);
                     stream.beginText();
                     stream.newLineAtOffset(pdfX, pdfY);
                     try {
                         stream.showText(text);
                     } catch (Exception e) {
-                        log("OCR ошибка при обработке строки \"" + text + "\" на странице " + num + ": " + e);
+                        log("OCR ошибка при обработке слова \"" + text + "\" на странице " + num + ": " + e);
                     } finally {
                         stream.endText();
                     }
                 }
+                stream.setHorizontalScaling(100f);
             }
         }
 
