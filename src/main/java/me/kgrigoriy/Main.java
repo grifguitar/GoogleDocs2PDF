@@ -36,6 +36,11 @@ import java.util.regex.*;
 
 import javax.imageio.ImageIO;
 
+import org.jsoup.Jsoup;
+import org.jsoup.nodes.Document;
+import org.jsoup.nodes.Element;
+import org.jsoup.select.Elements;
+
 public class Main {
 
     public static void main(String[] args) {
@@ -53,6 +58,8 @@ public class Main {
         static final int DOC_WIDTH = 820;
         static final int DOC_SCROLL_STEP = 1133;
         static final String PREVIEW = "/preview";
+        static final String MOBILE_BASIC = "/mobilebasic";
+        static final String HTML_PRESENT = "/htmlpresent";
         static final double SCALE = 3.0;
         static final int MAX_PAGES = 1000;
 
@@ -81,6 +88,7 @@ public class Main {
         private Button convertButton;
         private CheckBox ocrCheckBox;
         private CheckBox onlyTextCheckBox;
+        private CheckBox mobileHtmlCheckBox;
         private TextArea logArea;
         private Stage primaryStage;
 
@@ -127,11 +135,22 @@ public class Main {
             outRow.setAlignment(Pos.CENTER_LEFT);
 
             ocrCheckBox = new CheckBox("OCR");
-            ocrCheckBox.setSelected(true);
+            ocrCheckBox.setSelected(false);
 
             onlyTextCheckBox = new CheckBox("Text only");
             onlyTextCheckBox.setSelected(false);
             onlyTextCheckBox.disableProperty().bind(ocrCheckBox.selectedProperty().not());
+
+            mobileHtmlCheckBox = new CheckBox("HTML mode");
+            mobileHtmlCheckBox.setSelected(true);
+
+            ocrCheckBox.disableProperty().bind(mobileHtmlCheckBox.selectedProperty());
+            mobileHtmlCheckBox.selectedProperty().addListener((obs, oldVal, newVal) -> {
+                if (newVal) {
+                    ocrCheckBox.setSelected(false);
+                    onlyTextCheckBox.setSelected(false);
+                }
+            });
 
             convertButton = new Button("Конвертировать");
             convertButton.setDefaultButton(true);
@@ -164,6 +183,7 @@ public class Main {
 
                 final boolean useOcr = ocrCheckBox.isSelected();
                 final boolean onlyText = onlyTextCheckBox.isSelected() && useOcr;
+                final boolean useMobileHtml = mobileHtmlCheckBox.isSelected();
 
                 convertButton.setDisable(true);
                 logArea.clear();
@@ -171,8 +191,15 @@ public class Main {
                 Thread thread = new Thread(() -> {
                     try {
                         log("Тип документа: " + link.t().name());
+
+                        if (useMobileHtml) {
+                            log("Режим: Mobile/HTML");
+                        } else {
+                            log("Режим: Скриншоты" + (useOcr ? " + OCR" : ""));
+                        }
+
                         ensureChromiumInstalled();
-                        if (useOcr)
+                        if (useOcr && !useMobileHtml)
                             ensureTesseractReady();
                         try (PDDocument pdf = new PDDocument();
                                 Playwright playwright = Playwright.create();
@@ -181,9 +208,18 @@ public class Main {
                                 BrowserContext ctx = browser.newContext(
                                         new Browser.NewContextOptions().setDeviceScaleFactor(Google.SCALE));
                                 Page page = ctx.newPage()) {
-                            parsePage(page, link, pdf, useOcr, onlyText);
-                            pdf.save(outputPath);
-                            log("PDF сохранён: " + outputPath);
+
+                            if (useMobileHtml) {
+                                String filename = outputPath.replaceAll(".pdf", ".html");
+                                try (FileWriter out = new FileWriter(filename)) {
+                                    parseSinglePageHtmlMode(page, link, out);
+                                }
+                                log("HTML сохранён: " + filename);
+                            } else {
+                                parsePage(page, link, pdf, useOcr, onlyText);
+                                pdf.save(outputPath);
+                                log("PDF сохранён: " + outputPath);
+                            }
                         }
                     } catch (InterruptedException ex) {
                         Thread.currentThread().interrupt();
@@ -198,7 +234,7 @@ public class Main {
                 thread.start();
 
             });
-            HBox btnRow = new HBox(12, ocrCheckBox, onlyTextCheckBox, convertButton);
+            HBox btnRow = new HBox(8, ocrCheckBox, onlyTextCheckBox, mobileHtmlCheckBox, convertButton);
             btnRow.setAlignment(Pos.CENTER_RIGHT);
 
             logArea = new TextArea();
@@ -211,7 +247,7 @@ public class Main {
             VBox root = new VBox(10, urlRow, outRow, btnRow, new Label("Лог:"), logArea);
             root.setPadding(new Insets(16));
 
-            stage.setScene(new Scene(root, 680, 440));
+            stage.setScene(new Scene(root, 750, 440));
             stage.setMinWidth(500);
             stage.setMinHeight(380);
             stage.show();
@@ -229,14 +265,86 @@ public class Main {
 
         private Link parseLink(String link) {
             Matcher slides = Pattern.compile(Google.Presentation.regex).matcher(link);
-            if (slides.find())
+            if (slides.find()) {
+                String suffix = mobileHtmlCheckBox.isSelected()
+                        ? Google.HTML_PRESENT
+                        : Google.PREVIEW;
                 return new Link(Google.Presentation,
-                        Google.Presentation.prefix + slides.group(1) + Google.PREVIEW);
+                        Google.Presentation.prefix + slides.group(1) + suffix);
+            }
             Matcher docs = Pattern.compile(Google.Document.regex).matcher(link);
-            if (docs.find())
+            if (docs.find()) {
+                String suffix = mobileHtmlCheckBox.isSelected()
+                        ? Google.MOBILE_BASIC
+                        : Google.PREVIEW;
                 return new Link(Google.Document,
-                        Google.Document.prefix + docs.group(1) + Google.PREVIEW);
+                        Google.Document.prefix + docs.group(1) + suffix);
+            }
             return null;
+        }
+
+        private void parseSinglePageHtmlMode(Page page, Link link, FileWriter out) throws IOException {
+            log("HTML: " + link.url());
+            Document doc = Jsoup.connect(link.url())
+                    .userAgent(
+                            "Mozilla/5.0 (Linux; Android 12; Pixel 6) "
+                                    + "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                    + "Chrome/120.0.0.0 Mobile Safari/537.36")
+                    .timeout(30_000)
+                    .get();
+            out.append("<!DOCTYPE html><html><head><meta charset='UTF-8'><title>")
+                    .append(doc.title().trim().isEmpty() ? "Документ" : doc.title().trim())
+                    .append("</title></head><body>");
+            Elements all = doc.select("h1,h2,h3,h4,h5,h6,p,li,table");
+            for (Element el : all) {
+                String tag = el.tagName().toLowerCase();
+                String text = el.text().trim();
+                if (text.isEmpty())
+                    continue;
+                if ("table".equals(tag)) {
+                    renderSimpleTable(el, out);
+                } else if (tag.matches("h[1-6]")) {
+                    String level = Integer.toString(tag.charAt(1) - '0');
+                    out.append("<h").append(level).append(">").append(text)
+                            .append("</h").append(level).append(">\n");
+                } else if ("li".equals(tag)) {
+                    out.append("<ul><li>").append(text).append("</li></ul>\n");
+                } else {
+                    out.append("<p>").append(text).append("</p>\n");
+                }
+            }
+            out.append("</body></html>");
+        }
+
+        private static void renderSimpleTable(Element table, FileWriter out) throws IOException {
+            out.append("<table border='1'>\n");
+            Elements rows = table.select("tr");
+            if (!rows.isEmpty()) {
+                for (Element row : rows) {
+                    out.append("<tr>");
+                    row.select("td,th").forEach(cell -> {
+                        try {
+                            out.append("<").append(cell.tagName()).append(">")
+                                    .append(cell.text().trim()).append("</").append(cell.tagName()).append(">");
+                        } catch (IOException e) {
+                        }
+                    });
+                    out.append("</tr>\n");
+                }
+            } else {
+                Elements cells = table.select("td,th");
+                if (!cells.isEmpty()) {
+                    out.append("<tr>");
+                    cells.forEach(cell -> {
+                        try {
+                            out.append("<td>").append(cell.text().trim()).append("</td>");
+                        } catch (IOException e) {
+                        }
+                    });
+                    out.append("</tr>\n");
+                }
+            }
+            out.append("</table>\n");
         }
 
         private Path getCachePath() {
