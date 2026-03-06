@@ -100,7 +100,7 @@ public class Main {
         @Override
         public void start(Stage stage) {
             this.primaryStage = stage;
-            stage.setTitle("GoogleDocs2PDF by Grigoriy for Anna💕 v1.0");
+            stage.setTitle("GoogleDocs2PDF by Grigoriy for Anna💕 v1.1");
 
             InputStream iconStream = getClass().getResourceAsStream("/icon.png");
             if (iconStream != null) {
