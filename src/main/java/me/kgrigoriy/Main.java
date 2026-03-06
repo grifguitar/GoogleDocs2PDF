@@ -415,22 +415,16 @@ public class Main {
                     float pdfY = pageHeight - (bbox.y + bbox.height) * scaleY;
                     float baseHeight = bbox.height * scaleY * 0.85f;
 
-                    float smoothedSize = baseHeight;
-                    if (!recentSizes.isEmpty()) {
-                        float totalWeighted = 0f;
-                        float totalWeight = 0f;
-                        for (int i = 0; i < Math.min(3, recentSizes.size()); i++) {
-                            float weight = 0.5f - (i * 0.1f);
-                            totalWeighted += recentSizes.get(recentSizes.size() - 1 - i) * weight;
-                            totalWeight += weight;
-                        }
-                        smoothedSize = (baseHeight * 0.6f + totalWeighted / totalWeight * 0.4f);
-                    }
-
-                    smoothedSize = Math.max(smoothedSize, 8f);
-                    recentSizes.add(smoothedSize);
-                    if (recentSizes.size() > 5)
+                    recentSizes.add(baseHeight);
+                    if (recentSizes.size() > 5) {
                         recentSizes.remove(0);
+                    }
+                    float sum = 0f;
+                    for (Float s : recentSizes) {
+                        sum += s;
+                    }
+                    float smoothedSize = sum / recentSizes.size();
+                    smoothedSize = Math.max(smoothedSize, 8f);
 
                     stream.setFont(font, smoothedSize);
 
