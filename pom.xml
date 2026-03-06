@@ -5,7 +5,7 @@
          http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
     <groupId>me.kgrigoriy</groupId>
-    <artifactId>GoogleDocs2PDF</artifactId>
+    <artifactId>GoogleDocs2PDFBot</artifactId>
     <version>1.1</version>
 
     <properties>
@@ -16,9 +16,9 @@
 
     <dependencies>
         <dependency>
-            <groupId>org.openjfx</groupId>
-            <artifactId>javafx-controls</artifactId>
-            <version>25.0.2</version>
+            <groupId>org.telegram</groupId>
+            <artifactId>telegrambots</artifactId>
+            <version>6.9.7.1</version>
         </dependency>
         <dependency>
             <groupId>com.microsoft.playwright</groupId>
@@ -45,18 +45,15 @@
             <artifactId>jsoup</artifactId>
             <version>1.17.2</version>
         </dependency>
+        <dependency>
+            <groupId>commons-io</groupId>
+            <artifactId>commons-io</artifactId>
+            <version>2.16.1</version>
+        </dependency>
     </dependencies>
 
     <build>
         <plugins>
-            <plugin>
-                <groupId>org.openjfx</groupId>
-                <artifactId>javafx-maven-plugin</artifactId>
-                <version>0.0.8</version>
-                <configuration>
-                    <mainClass>me.kgrigoriy.Main</mainClass>
-                </configuration>
-            </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-shade-plugin</artifactId>
@@ -69,9 +66,6 @@
                             <transformers>
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
                                     <mainClass>me.kgrigoriy.Main</mainClass>
-                                    <manifestEntries>
-                                        <Enable-Native-Access>ALL-UNNAMED</Enable-Native-Access>
-                                    </manifestEntries>
                                 </transformer>
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
                             </transformers>
@@ -82,7 +76,6 @@
                                         <exclude>META-INF/*.SF</exclude>
                                         <exclude>META-INF/*.DSA</exclude>
                                         <exclude>META-INF/*.RSA</exclude>
-                                        <exclude>module-info.class</exclude>
                                     </excludes>
                                 </filter>
                             </filters>

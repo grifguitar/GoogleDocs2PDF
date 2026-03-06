@@ -4,17 +4,6 @@ import com.microsoft.playwright.*;
 import com.microsoft.playwright.options.LoadState;
 import com.microsoft.playwright.options.ScreenshotType;
 
-import javafx.application.Application;
-import javafx.application.Platform;
-import javafx.geometry.Insets;
-import javafx.geometry.Pos;
-import javafx.scene.Scene;
-import javafx.scene.control.*;
-import javafx.scene.image.Image;
-import javafx.scene.layout.*;
-import javafx.stage.FileChooser;
-import javafx.stage.Stage;
-
 import net.sourceforge.tess4j.ITessAPI;
 import net.sourceforge.tess4j.Tesseract;
 import net.sourceforge.tess4j.Word;
@@ -27,29 +16,47 @@ import org.apache.pdfbox.pdmodel.font.PDType0Font;
 import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
 import org.apache.pdfbox.pdmodel.graphics.state.RenderingMode;
 
+import javax.imageio.ImageIO;
 import java.awt.Rectangle;
 import java.awt.image.BufferedImage;
 import java.io.*;
 import java.nio.file.*;
 import java.util.*;
+import java.util.concurrent.*;
 import java.util.regex.*;
-
-import javax.imageio.ImageIO;
 
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
 import org.jsoup.nodes.Element;
 import org.jsoup.nodes.Node;
 import org.jsoup.nodes.TextNode;
-import org.jsoup.select.Elements;
+
+import org.telegram.telegrambots.bots.TelegramLongPollingBot;
+import org.telegram.telegrambots.meta.TelegramBotsApi;
+import org.telegram.telegrambots.meta.api.methods.send.SendDocument;
+import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
+import org.telegram.telegrambots.meta.api.objects.InputFile;
+import org.telegram.telegrambots.meta.api.objects.Update;
+import org.telegram.telegrambots.meta.api.objects.replykeyboard.ReplyKeyboardMarkup;
+import org.telegram.telegrambots.meta.api.objects.replykeyboard.ReplyKeyboardRemove;
+import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.KeyboardRow;
+import org.telegram.telegrambots.updatesreceivers.DefaultBotSession;
 
 public class Main {
 
-    public static void main(String[] args) {
-        App.run(args);
+    public static void main(String[] args) throws Exception {
+        String username = "GoogleDocs2PDFBot";
+        String token;
+        try (BufferedReader in = new BufferedReader(new FileReader("token"))) {
+            token = in.readLine().strip();
+        }
+
+        TelegramBotsApi api = new TelegramBotsApi(DefaultBotSession.class);
+        api.registerBot(new GDocsBot(token, username));
+        System.out.println("Бот запущен: @" + username);
     }
 
-    public enum Google {
+    enum Google {
         Presentation(1920, 1080,
                 "https://docs.google.com/presentation/d/",
                 "docs\\.google\\.com/presentation/d/([a-zA-Z0-9_-]+)"),
@@ -76,217 +83,162 @@ public class Main {
         }
     }
 
-    public static record Link(Google t, String url) {
+    record Link(Google t, String url) {
     }
 
-    public static class App extends Application {
+    enum Mode {
+        OCR, OCR_ONLY_TEXT, HTML
+    }
 
-        public static void run(String[] args) {
-            launch(args);
-        }
+    enum State {
+        AWAITING_MODE, AWAITING_URL, PROCESSING
+    }
 
-        private TextField urlField;
-        private TextField outputField;
-        private Button convertButton;
-        private CheckBox ocrCheckBox;
-        private CheckBox onlyTextCheckBox;
-        private CheckBox mobileHtmlCheckBox;
-        private TextArea logArea;
-        private Stage primaryStage;
+    static class Session {
+        volatile Mode mode = null;
+        volatile State state = State.AWAITING_MODE;
+    }
 
-        private Tesseract tesseract;
-        private Path tmpDir;
+    static class GDocsBot extends TelegramLongPollingBot {
 
-        @Override
-        public void start(Stage stage) {
-            this.primaryStage = stage;
-            stage.setTitle("GoogleDocs2PDF by Grigoriy for Anna💕 v1.1");
+        private final String username;
 
-            InputStream iconStream = getClass().getResourceAsStream("/icon.png");
-            if (iconStream != null) {
-                stage.getIcons().add(new Image(iconStream));
-            }
+        private final Map<Long, Session> sessions = new ConcurrentHashMap<>();
+        private final ExecutorService executor = Executors.newCachedThreadPool();
 
-            Label urlLabel = new Label("Ссылка:");
-            urlLabel.setMinWidth(80);
-            urlField = new TextField();
-            urlField.setPromptText("https://docs.google.com/link");
-            HBox.setHgrow(urlField, Priority.ALWAYS);
-            HBox urlRow = new HBox(8, urlLabel, urlField);
-            urlRow.setAlignment(Pos.CENTER_LEFT);
+        private volatile Tesseract tesseract;
+        private volatile Path tmpDir;
 
-            Label outLabel = new Label("Сохранить:");
-            outLabel.setMinWidth(80);
-            outputField = new TextField();
-            outputField.setPromptText("file");
-            HBox.setHgrow(outputField, Priority.ALWAYS);
-            Button browseBtn = new Button("Обзор");
-            browseBtn.setOnAction(e -> {
-
-                FileChooser fc = new FileChooser();
-                fc.setTitle("Сохранить как");
-                fc.getExtensionFilters().add(
-                        new FileChooser.ExtensionFilter("Файлы", "*.*"));
-                fc.setInitialFileName("file");
-                File file = fc.showSaveDialog(primaryStage);
-                if (file != null)
-                    outputField.setText(file.getAbsolutePath());
-
-            });
-            HBox outRow = new HBox(8, outLabel, outputField, browseBtn);
-            outRow.setAlignment(Pos.CENTER_LEFT);
-
-            ocrCheckBox = new CheckBox("OCR");
-            ocrCheckBox.setSelected(false);
-
-            onlyTextCheckBox = new CheckBox("Text only");
-            onlyTextCheckBox.setSelected(false);
-            onlyTextCheckBox.disableProperty().bind(ocrCheckBox.selectedProperty().not());
-
-            mobileHtmlCheckBox = new CheckBox("HTML mode");
-            mobileHtmlCheckBox.setSelected(true);
-
-            ocrCheckBox.disableProperty().bind(mobileHtmlCheckBox.selectedProperty());
-            mobileHtmlCheckBox.selectedProperty().addListener((obs, oldVal, newVal) -> {
-                if (newVal) {
-                    ocrCheckBox.setSelected(false);
-                    onlyTextCheckBox.setSelected(false);
-                }
-            });
-
-            convertButton = new Button("Конвертировать");
-            convertButton.setDefaultButton(true);
-            convertButton.setOnAction(e -> {
-
-                String rawUrl = urlField.getText().trim();
-                String outputRaw = outputField.getText().trim();
-
-                if (rawUrl.isEmpty()) {
-                    log("Введите ссылку");
-                    return;
-                }
-                if (outputRaw.isEmpty()) {
-                    log("Введите имя файла для сохранения");
-                    return;
-                }
-
-                Link link = parseLink(rawUrl);
-                if (link == null) {
-                    log("Некорректная ссылка: поддерживаются Google Slides и Google Docs");
-                    return;
-                }
-
-                final boolean useOcr = ocrCheckBox.isSelected();
-                final boolean onlyText = onlyTextCheckBox.isSelected() && useOcr;
-                final boolean useMobileHtml = mobileHtmlCheckBox.isSelected();
-
-                final String outputPath = (!useMobileHtml)
-                        ? (outputRaw.toLowerCase().endsWith(".pdf") ? outputRaw : outputRaw + ".pdf")
-                        : (outputRaw.toLowerCase().endsWith(".html") ? outputRaw : outputRaw + ".html");
-
-                if (!outputRaw.equals(outputPath))
-                    Platform.runLater(() -> outputField.setText(outputPath));
-
-                convertButton.setDisable(true);
-                logArea.clear();
-
-                Thread thread = new Thread(() -> {
-                    try {
-                        log("Тип документа: " + link.t().name());
-
-                        if (useMobileHtml) {
-                            log("Режим: Mobile/HTML");
-                            try (FileWriter out = new FileWriter(outputPath)) {
-                                parseSinglePageHtmlMode(link, out);
-                            }
-                            log("HTML сохранён: " + outputPath);
-                        } else {
-                            log("Режим: Скриншоты" + (useOcr ? " + OCR" : ""));
-                            ensureChromiumInstalled();
-                            if (useOcr)
-                                ensureTesseractReady();
-                            try (PDDocument pdf = new PDDocument();
-                                    Playwright playwright = Playwright.create();
-                                    Browser browser = playwright.chromium().launch(
-                                            new BrowserType.LaunchOptions().setHeadless(true));
-                                    BrowserContext ctx = browser.newContext(
-                                            new Browser.NewContextOptions().setDeviceScaleFactor(Google.SCALE));
-                                    Page page = ctx.newPage()) {
-
-                                parsePage(page, link, pdf, useOcr, onlyText);
-                                pdf.save(outputPath);
-                                log("PDF сохранён: " + outputPath);
-                            }
-                        }
-                    } catch (InterruptedException ex) {
-                        Thread.currentThread().interrupt();
-                        log("Конвертация прервана");
-                    } catch (Exception ex) {
-                        log("Ошибка: " + ex);
-                    } finally {
-                        Platform.runLater(() -> convertButton.setDisable(false));
-                    }
-                }, "converter-thread");
-                thread.setDaemon(true);
-                thread.start();
-
-            });
-            HBox btnRow = new HBox(8, ocrCheckBox, onlyTextCheckBox, mobileHtmlCheckBox, convertButton);
-            btnRow.setAlignment(Pos.CENTER_RIGHT);
-
-            logArea = new TextArea();
-            logArea.setEditable(false);
-            logArea.setPrefHeight(230);
-            logArea.setWrapText(true);
-            logArea.setStyle("-fx-font-family: 'Courier New', monospace; -fx-font-size: 12px;");
-            VBox.setVgrow(logArea, Priority.ALWAYS);
-
-            VBox root = new VBox(10, urlRow, outRow, btnRow, new Label("Лог:"), logArea);
-            root.setPadding(new Insets(16));
-
-            stage.setScene(new Scene(root, 750, 440));
-            stage.setMinWidth(500);
-            stage.setMinHeight(380);
-            stage.show();
+        public GDocsBot(String token, String username) {
+            super(token);
+            this.username = username;
         }
 
         @Override
-        public void stop() {
-            if (tmpDir != null)
-                FileUtils.deleteQuietly(tmpDir.toFile());
+        public String getBotUsername() {
+            return username;
         }
 
-        private void log(String msg) {
-            Platform.runLater(() -> logArea.appendText(msg + "\n"));
-        }
+        @Override
+        public void onUpdateReceived(Update update) {
+            if (!update.hasMessage() || !update.getMessage().hasText())
+                return;
 
-        private Link parseLink(String link) {
-            Matcher slides = Pattern.compile(Google.Presentation.regex).matcher(link);
-            if (slides.find()) {
-                String suffix = mobileHtmlCheckBox.isSelected()
-                        ? Google.HTML_PRESENT
-                        : Google.PREVIEW;
-                return new Link(Google.Presentation,
-                        Google.Presentation.prefix + slides.group(1) + suffix);
+            long chatId = update.getMessage().getChatId();
+            String text = update.getMessage().getText().trim();
+
+            Session session = sessions.computeIfAbsent(chatId, id -> new Session());
+
+            if (text.equals("/start") || text.equals("/reset")) {
+                session.state = State.AWAITING_MODE;
+                session.mode = null;
+                sendModeKeyboard(chatId, "Привет! Выбери режим обработки:");
+                return;
             }
-            Matcher docs = Pattern.compile(Google.Document.regex).matcher(link);
-            if (docs.find()) {
-                String suffix = mobileHtmlCheckBox.isSelected()
-                        ? Google.MOBILE_BASIC
-                        : Google.PREVIEW;
-                return new Link(Google.Document,
-                        Google.Document.prefix + docs.group(1) + suffix);
+
+            switch (session.state) {
+                case AWAITING_MODE -> handleMode(chatId, text, session);
+                case AWAITING_URL -> handleUrl(chatId, text, session);
+                case PROCESSING -> sendText(chatId, "Уже обрабатываю твой запрос, подожди...", null);
             }
-            return null;
         }
 
-        private void parseSinglePageHtmlMode(Link link, FileWriter out) throws IOException {
-            log("HTML: " + link.url());
+        private void handleMode(long chatId, String text, Session session) {
+            Mode mode = switch (text) {
+                case "OCR" -> Mode.OCR;
+                case "OCR+OnlyText" -> Mode.OCR_ONLY_TEXT;
+                case "HTML" -> Mode.HTML;
+                default -> null;
+            };
+
+            if (mode == null) {
+                sendModeKeyboard(chatId, "Выбери режим с помощью кнопок:");
+                return;
+            }
+
+            session.mode = mode;
+            session.state = State.AWAITING_URL;
+            sendText(chatId,
+                    "Режим *" + text + "* выбран.\n\nПришли ссылку на Google Slides или Google Docs:",
+                    removeKeyboard());
+        }
+
+        private void handleUrl(long chatId, String text, Session session) {
+            if (!text.startsWith("http://") && !text.startsWith("https://")) {
+                sendText(chatId, "Не похоже на URL. Пришли ссылку, начинающуюся с https://", null);
+                return;
+            }
+
+            Link link = parseLink(text, session.mode);
+            if (link == null) {
+                sendText(chatId,
+                        "Ссылка не распознана.\nПоддерживаются:\n" +
+                                "• https://docs.google.com/presentation/d/...\n" +
+                                "• https://docs.google.com/document/d/...",
+                        null);
+                return;
+            }
+
+            session.state = State.PROCESSING;
+            sendText(chatId, "Начинаю обработку, это может занять несколько минут...", null);
+
+            executor.submit(() -> {
+                File result = null;
+                try {
+                    result = process(link, session.mode, chatId);
+                    sendDocument(chatId, result, "Готово!");
+                } catch (Exception e) {
+                    sendText(chatId, "Ошибка: " + e.getMessage(), null);
+                    e.printStackTrace();
+                } finally {
+                    if (result != null)
+                        result.delete();
+                    session.state = State.AWAITING_MODE;
+                    session.mode = null;
+                    sendModeKeyboard(chatId, "Хочешь обработать ещё? Выбери режим:");
+                }
+            });
+        }
+
+        private File process(Link link, Mode mode, long chatId) throws Exception {
+            if (mode == Mode.HTML) {
+                File out = File.createTempFile("gdocs_", ".html");
+                try (FileWriter fw = new FileWriter(out, java.nio.charset.StandardCharsets.UTF_8)) {
+                    log(chatId, "HTML: " + link.url());
+                    parseSinglePageHtmlMode(link, fw, chatId);
+                }
+                return out;
+            }
+
+            boolean ocr = (mode == Mode.OCR || mode == Mode.OCR_ONLY_TEXT);
+            boolean onlyTxt = (mode == Mode.OCR_ONLY_TEXT);
+
+            ensureChromiumInstalled(chatId);
+            if (ocr)
+                ensureTesseractReady(chatId);
+
+            File out = File.createTempFile("gdocs_", ".pdf");
+            try (PDDocument pdf = new PDDocument();
+                    Playwright playwright = Playwright.create();
+                    Browser browser = playwright.chromium().launch(
+                            new BrowserType.LaunchOptions().setHeadless(true));
+                    BrowserContext ctx = browser.newContext(
+                            new Browser.NewContextOptions()
+                                    .setDeviceScaleFactor(Google.SCALE));
+                    Page page = ctx.newPage()) {
+
+                parsePage(page, link, pdf, ocr, onlyTxt, chatId);
+                pdf.save(out);
+            }
+            return out;
+        }
+
+        private void parseSinglePageHtmlMode(Link link, FileWriter out, long chatId)
+                throws IOException {
             Document doc = Jsoup.connect(link.url())
-                    .userAgent(
-                            "Mozilla/5.0 (Linux; Android 12; Pixel 6) "
-                                    + "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                    + "Chrome/120.0.0.0 Mobile Safari/537.36")
+                    .userAgent("Mozilla/5.0 (Linux; Android 12; Pixel 6) " +
+                            "AppleWebKit/537.36 (KHTML, like Gecko) " +
+                            "Chrome/120.0.0.0 Mobile Safari/537.36")
                     .timeout(30_000)
                     .get();
 
@@ -297,236 +249,155 @@ public class Main {
                     .append("</head><body>\n");
 
             renderNode(doc.body(), out);
-
             out.append("</body></html>");
+            log(chatId, "HTML собран: " + title);
         }
 
         private void renderNode(Node node, FileWriter out) throws IOException {
-            if (node instanceof TextNode) {
-                String text = ((TextNode) node).text();
-                if (!text.isBlank()) {
-                    out.append(escapeHtml(text));
-                }
+            if (node instanceof TextNode tn) {
+                String t = tn.text();
+                if (!t.isBlank())
+                    out.append(escapeHtml(t));
                 return;
             }
-
-            if (!(node instanceof Element))
+            if (!(node instanceof Element el))
                 return;
 
-            Element el = (Element) node;
             String tag = el.tagName().toLowerCase();
-
             switch (tag) {
-                case "h1":
-                case "h2":
-                case "h3":
-                case "h4":
-                case "h5":
-                case "h6":
+                case "h1", "h2", "h3", "h4", "h5", "h6" -> {
                     out.append("<").append(tag).append(">");
                     renderInlineContent(el, out);
                     out.append("</").append(tag).append(">\n");
-                    break;
-
-                case "p":
+                }
+                case "p" -> {
                     out.append("<p>");
                     renderInlineContent(el, out);
                     out.append("</p>\n");
-                    break;
-
-                case "div":
-                case "section":
-                case "article":
-                case "main":
-                case "aside":
-                case "header":
-                case "footer":
-                case "nav":
-                case "form":
+                }
+                case "div", "section", "article", "main", "aside", "header", "footer", "nav", "form" -> {
                     if (!el.ownText().isBlank()) {
                         out.append("<p>");
                         renderInlineContent(el, out);
                         out.append("</p>\n");
                     } else {
-                        for (Node child : el.childNodes()) {
+                        for (Node child : el.childNodes())
                             renderNode(child, out);
-                        }
                     }
-                    break;
-
-                case "ul":
+                }
+                case "ul" -> {
                     out.append("<ul>\n");
                     for (Node child : el.childNodes())
                         renderNode(child, out);
                     out.append("</ul>\n");
-                    break;
-
-                case "ol":
+                }
+                case "ol" -> {
                     out.append("<ol>\n");
                     for (Node child : el.childNodes())
                         renderNode(child, out);
                     out.append("</ol>\n");
-                    break;
-
-                case "li":
+                }
+                case "li" -> {
                     out.append("<li>");
                     renderInlineContent(el, out);
-                    for (Element nested : el.select("> ul, > ol")) {
+                    for (Element nested : el.select("> ul, > ol"))
                         renderNode(nested, out);
-                    }
                     out.append("</li>\n");
-                    break;
-
-                case "table":
-                    renderTable(el, out);
-                    break;
-
-                case "br":
-                    out.append("<br>\n");
-                    break;
-
-                case "hr":
-                    out.append("<hr>\n");
-                    break;
-
-                case "pre":
-                case "code":
-                    out.append("<").append(tag).append(">")
-                            .append(escapeHtml(el.wholeText()))
-                            .append("</").append(tag).append(">\n");
-                    break;
-
-                case "blockquote":
+                }
+                case "table" -> renderTable(el, out);
+                case "br" -> out.append("<br>\n");
+                case "hr" -> out.append("<hr>\n");
+                case "pre", "code" -> out.append("<").append(tag).append(">")
+                        .append(escapeHtml(el.wholeText()))
+                        .append("</").append(tag).append(">\n");
+                case "blockquote" -> {
                     out.append("<blockquote>");
                     renderInlineContent(el, out);
                     out.append("</blockquote>\n");
-                    break;
-
-                default:
-                    for (Node child : el.childNodes()) {
+                }
+                default -> {
+                    for (Node child : el.childNodes())
                         renderNode(child, out);
-                    }
-                    break;
+                }
             }
         }
 
         private void renderInlineContent(Element parent, FileWriter out) throws IOException {
             for (Node node : parent.childNodes()) {
-                if (node instanceof TextNode) {
-                    String text = ((TextNode) node).text();
-                    if (!text.isEmpty()) {
-                        out.append(escapeHtml(text));
-                    }
-                } else if (node instanceof Element) {
-                    Element el = (Element) node;
+                if (node instanceof TextNode tn) {
+                    String t = tn.text();
+                    if (!t.isEmpty())
+                        out.append(escapeHtml(t));
+                } else if (node instanceof Element el) {
                     String tag = el.tagName().toLowerCase();
-
                     switch (tag) {
-                        case "b":
-                        case "strong":
+                        case "b", "strong" -> {
                             out.append("<b>");
                             renderInlineContent(el, out);
                             out.append("</b>");
-                            break;
-                        case "i":
-                        case "em":
+                        }
+                        case "i", "em" -> {
                             out.append("<i>");
                             renderInlineContent(el, out);
                             out.append("</i>");
-                            break;
-                        case "u":
+                        }
+                        case "u" -> {
                             out.append("<u>");
                             renderInlineContent(el, out);
                             out.append("</u>");
-                            break;
-                        case "s":
-                        case "strike":
-                        case "del":
+                        }
+                        case "s", "strike", "del" -> {
                             out.append("<s>");
                             renderInlineContent(el, out);
                             out.append("</s>");
-                            break;
-                        case "sup":
+                        }
+                        case "sup" -> {
                             out.append("<sup>");
                             renderInlineContent(el, out);
                             out.append("</sup>");
-                            break;
-                        case "sub":
+                        }
+                        case "sub" -> {
                             out.append("<sub>");
                             renderInlineContent(el, out);
                             out.append("</sub>");
-                            break;
-                        case "a":
+                        }
+                        case "a" -> {
                             String href = el.attr("abs:href");
                             if (href.isEmpty())
                                 href = el.attr("href");
                             out.append("<a href='").append(escapeHtml(href)).append("'>");
                             renderInlineContent(el, out);
                             out.append("</a>");
-                            break;
-                        case "br":
-                            out.append("<br>\n");
-                            break;
-                        case "span":
-                        case "font":
-                        case "label":
+                        }
+                        case "br" -> out.append("<br>\n");
+                        case "span", "font", "label" -> {
                             String style = el.attr("style");
-                            boolean isBold = isCssBold(el, style);
-                            boolean isItalic = isCssItalic(el, style);
-                            if (isBold)
+                            boolean bold = isCssBold(style);
+                            boolean italic = isCssItalic(style);
+                            if (bold)
                                 out.append("<b>");
-                            if (isItalic)
+                            if (italic)
                                 out.append("<i>");
                             renderInlineContent(el, out);
-                            if (isItalic)
+                            if (italic)
                                 out.append("</i>");
-                            if (isBold)
+                            if (bold)
                                 out.append("</b>");
-                            break;
-                        case "code":
-                            out.append("<code>")
-                                    .append(escapeHtml(el.text()))
-                                    .append("</code>");
-                            break;
-                        default:
-                            renderInlineContent(el, out);
-                            break;
+                        }
+                        case "code" -> out.append("<code>").append(escapeHtml(el.text())).append("</code>");
+                        default -> renderInlineContent(el, out);
                     }
                 }
             }
         }
 
-        private boolean isCssBold(Element el, String style) {
-            if (style == null || style.isEmpty())
-                return false;
-            if (style.matches("(?i).*font-weight\\s*:\\s*(bold|bolder).*"))
-                return true;
-            java.util.regex.Matcher m = java.util.regex.Pattern
-                    .compile("(?i)font-weight\\s*:\\s*(\\d+)")
-                    .matcher(style);
-            if (m.find()) {
-                int weight = Integer.parseInt(m.group(1));
-                return weight >= 700;
-            }
-            return false;
-        }
-
-        private boolean isCssItalic(Element el, String style) {
-            if (style == null || style.isEmpty())
-                return false;
-            return style.matches("(?i).*font-style\\s*:\\s*(italic|oblique).*");
-        }
-
         private void renderTable(Element table, FileWriter out) throws IOException {
             out.append("<table border='1'>\n");
-            Elements rows = table.select("tr");
-            for (Element row : rows) {
+            for (Element row : table.select("tr")) {
                 if (!row.parents().first().closest("table").equals(table))
                     continue;
-
                 out.append("  <tr>");
                 for (Element cell : row.select("td, th")) {
-                    String cellTag = cell.tagName();
                     StringBuilder attrs = new StringBuilder();
                     String colspan = cell.attr("colspan");
                     String rowspan = cell.attr("rowspan");
@@ -534,86 +405,21 @@ public class Main {
                         attrs.append(" colspan='").append(escapeHtml(colspan)).append("'");
                     if (!rowspan.isEmpty() && !rowspan.equals("1"))
                         attrs.append(" rowspan='").append(escapeHtml(rowspan)).append("'");
-
-                    out.append("<").append(cellTag).append(attrs).append(">");
-                    if (cell.text().trim().isEmpty()) {
+                    String ct = cell.tagName();
+                    out.append("<").append(ct).append(attrs).append(">");
+                    if (cell.text().trim().isEmpty())
                         out.append("&nbsp;");
-                    } else {
+                    else
                         renderInlineContent(cell, out);
-                    }
-                    out.append("</").append(cellTag).append(">");
+                    out.append("</").append(ct).append(">");
                 }
                 out.append("</tr>\n");
             }
             out.append("</table>\n");
         }
 
-        private static String escapeHtml(String text) {
-            if (text == null)
-                return "";
-            return text
-                    .replace("&", "&amp;")
-                    .replace("<", "&lt;")
-                    .replace(">", "&gt;")
-                    .replace("\"", "&quot;")
-                    .replace("'", "&#39;");
-        }
-
-        private Path getCachePath() {
-            String os = System.getProperty("os.name").toLowerCase();
-            String home = System.getProperty("user.home");
-            if (os.contains("win"))
-                return Paths.get(home, "AppData", "Local", "ms-playwright");
-            if (os.contains("mac") || os.contains("darwin"))
-                return Paths.get(home, "Library", "Caches", "ms-playwright");
-            return Paths.get(home, ".cache", "ms-playwright");
-        }
-
-        private void ensureChromiumInstalled() throws IOException, InterruptedException {
-            if (Files.exists(getCachePath())) {
-                log("Chromium уже установлен");
-                return;
-            }
-            log("Устанавливаю Chromium");
-            ProcessBuilder pb = new ProcessBuilder(
-                    "java", "-cp", System.getProperty("java.class.path"),
-                    "com.microsoft.playwright.CLI", "install", "chromium");
-            pb.inheritIO();
-            int code = pb.start().waitFor();
-            if (code != 0)
-                throw new IOException("Код выхода: " + code);
-            log("Chromium установлен");
-        }
-
-        private void ensureTesseractReady() throws IOException {
-            if (tesseract != null) {
-                return;
-            }
-            log("Подготовка OCR");
-            if (tmpDir != null) {
-                FileUtils.deleteQuietly(tmpDir.toFile());
-                tmpDir = null;
-            }
-            tmpDir = Files.createTempDirectory("gdocs2pdf");
-            Path data = tmpDir.resolve("tessdata");
-            Files.createDirectory(data);
-            for (String f : List.of("rus.traineddata", "eng.traineddata", "osd.traineddata")) {
-                InputStream is = getClass().getResourceAsStream("/tessdata/" + f);
-                if (is == null)
-                    throw new IOException("Отсутствует: /tessdata/" + f);
-                Files.copy(is, data.resolve(f));
-            }
-            log("OCR загружен");
-            tesseract = new Tesseract();
-            tesseract.setDatapath(data.toAbsolutePath().toString());
-            tesseract.setLanguage("rus+eng");
-            tesseract.setPageSegMode(1);
-            tesseract.setOcrEngineMode(1);
-            tesseract.setVariable("user_defined_dpi", String.valueOf((int) (96 * Google.SCALE)));
-            log("OCR готов");
-        }
-
-        private void parsePage(Page page, Link link, PDDocument pdf, boolean ocr, boolean txt) throws IOException {
+        private void parsePage(Page page, Link link, PDDocument pdf,
+                boolean ocr, boolean txt, long chatId) throws IOException {
             page.setViewportSize(link.t().width, link.t().height);
 
             PDFont font = null;
@@ -654,16 +460,16 @@ public class Main {
                     }
 
                     if (Arrays.equals(prev, shot)) {
-                        log("Страниц всего: " + saved);
+                        log(chatId, "Страниц всего: " + saved);
                         return;
                     }
 
                     try {
-                        addPage(pdf, shot, num, font, txt);
+                        addPage(pdf, shot, num, font, txt, chatId);
                         saved++;
-                        log("Страница: " + num);
+                        log(chatId, "Страница: " + num);
                     } catch (Exception e) {
-                        log("Страница " + num + " пропущена: " + e);
+                        log(chatId, "Страница " + num + " пропущена: " + e);
                     }
 
                     prev = shot;
@@ -677,20 +483,22 @@ public class Main {
                 } catch (Exception e) {
                     if (num == 1)
                         throw new IOException("Ошибка загрузки первой страницы", e);
-                    log("Страница " + num + " недоступна, пропускаю: " + e);
+                    log(chatId, "Страница " + num + " недоступна: " + e);
                     if (link.t() == Google.Presentation && prev != null) {
-                        log("Страниц всего: " + saved);
+                        log(chatId, "Страниц всего: " + saved);
                         return;
                     }
                 }
             }
-            log("ВНИМАНИЕ: достигнут лимит в " + Google.MAX_PAGES + " страниц");
+            log(chatId, "ВНИМАНИЕ: достигнут лимит " + Google.MAX_PAGES + " страниц");
         }
 
-        private void addPage(PDDocument pdf, byte[] shot, int num, PDFont font, boolean txt) throws IOException {
+        private void addPage(PDDocument pdf, byte[] shot, int num,
+                PDFont font, boolean txt, long chatId) throws IOException {
             BufferedImage image = ImageIO.read(new ByteArrayInputStream(shot));
             if (image == null)
-                throw new IOException("Ошибка декодирования скриншота на странице: " + num);
+                throw new IOException("Ошибка декодирования скриншота на стр. " + num);
+
             PDImageXObject pdImg = PDImageXObject.createFromByteArray(pdf, shot, "p" + num);
             float pageWidth = pdImg.getWidth() / (float) Google.SCALE;
             float pageHeight = pdImg.getHeight() / (float) Google.SCALE;
@@ -700,16 +508,16 @@ public class Main {
             try (PDPageContentStream stream = new PDPageContentStream(pdf, pdfPage)) {
                 if (!txt)
                     stream.drawImage(pdImg, 0, 0, pageWidth, pageHeight);
-
                 if (font == null || tesseract == null)
                     return;
 
                 List<Word> lines;
                 try {
-                    lines = tesseract.getWords(image, txt ? ITessAPI.TessPageIteratorLevel.RIL_TEXTLINE
-                            : ITessAPI.TessPageIteratorLevel.RIL_WORD);
+                    lines = tesseract.getWords(image,
+                            txt ? ITessAPI.TessPageIteratorLevel.RIL_TEXTLINE
+                                    : ITessAPI.TessPageIteratorLevel.RIL_WORD);
                 } catch (Exception e) {
-                    log("OCR ошибка на странице " + num + ": " + e);
+                    log(chatId, "OCR ошибка на стр. " + num + ": " + e);
                     return;
                 }
                 if (lines == null || lines.isEmpty())
@@ -719,7 +527,6 @@ public class Main {
 
                 float scaleX = pageWidth / image.getWidth();
                 float scaleY = pageHeight / image.getHeight();
-
                 List<Float> recentSizes = new ArrayList<>();
 
                 for (Word line : lines) {
@@ -731,7 +538,6 @@ public class Main {
                         continue;
 
                     Rectangle bbox = line.getBoundingBox();
-
                     float pdfX = bbox.x * scaleX;
                     float fontSize, pdfY, horizScaling;
 
@@ -744,7 +550,7 @@ public class Main {
                         try {
                             textWidth = font.getStringWidth(text) / 1000f * fontSize;
                         } catch (Exception e) {
-                            log("OCR: невозможно измерить ширину \"" + text + "\": " + e);
+                            log(chatId, "OCR: невозможно измерить ширину \"" + text + "\": " + e);
                             continue;
                         }
                         if (textWidth <= 0)
@@ -754,17 +560,15 @@ public class Main {
                         pdfY = pageHeight - (bbox.y + bbox.height) * scaleY;
                         float baseHeight = bbox.height * scaleY * 0.85f;
                         recentSizes.add(baseHeight);
-                        if (recentSizes.size() > 5) {
-                            recentSizes.remove(0);
-                        }
+                        if (recentSizes.size() > 5)
+                            recentSizes.removeFirst();
                         float sum = 0f;
-                        for (Float s : recentSizes) {
+                        for (Float s : recentSizes)
                             sum += s;
-                        }
-                        fontSize = sum / recentSizes.size();
-                        fontSize = Math.max(fontSize, 8f);
+                        fontSize = Math.max(sum / recentSizes.size(), 8f);
                         horizScaling = 100f;
                     }
+
                     stream.setFont(font, fontSize);
                     stream.setHorizontalScaling(horizScaling);
                     stream.beginText();
@@ -772,7 +576,7 @@ public class Main {
                     try {
                         stream.showText(text);
                     } catch (Exception e) {
-                        log("OCR ошибка при обработке слова \"" + text + "\" на странице " + num + ": " + e);
+                        log(chatId, "OCR ошибка слова \"" + text + "\" стр. " + num + ": " + e);
                     } finally {
                         stream.endText();
                     }
@@ -781,6 +585,153 @@ public class Main {
             }
         }
 
-    }
+        private Link parseLink(String rawUrl, Mode mode) {
+            boolean htmlMode = (mode == Mode.HTML);
 
+            Matcher slides = Pattern.compile(Google.Presentation.regex).matcher(rawUrl);
+            if (slides.find()) {
+                String suffix = htmlMode ? Google.HTML_PRESENT : Google.PREVIEW;
+                return new Link(Google.Presentation,
+                        Google.Presentation.prefix + slides.group(1) + suffix);
+            }
+            Matcher docs = Pattern.compile(Google.Document.regex).matcher(rawUrl);
+            if (docs.find()) {
+                String suffix = htmlMode ? Google.MOBILE_BASIC : Google.PREVIEW;
+                return new Link(Google.Document,
+                        Google.Document.prefix + docs.group(1) + suffix);
+            }
+            return null;
+        }
+
+        private void ensureChromiumInstalled(long chatId) throws IOException, InterruptedException {
+            Path cache = getCachePath();
+            if (Files.exists(cache)) {
+                log(chatId, "Chromium уже установлен");
+                return;
+            }
+            log(chatId, "Устанавливаю Chromium...");
+            ProcessBuilder pb = new ProcessBuilder(
+                    "java", "-cp", System.getProperty("java.class.path"),
+                    "com.microsoft.playwright.CLI", "install", "chromium");
+            pb.inheritIO();
+            int code = pb.start().waitFor();
+            if (code != 0)
+                throw new IOException("Chromium: код выхода " + code);
+            log(chatId, "Chromium установлен");
+        }
+
+        private synchronized void ensureTesseractReady(long chatId) throws IOException {
+            if (tesseract != null)
+                return;
+            log(chatId, "Подготовка OCR...");
+            if (tmpDir != null) {
+                FileUtils.deleteQuietly(tmpDir.toFile());
+                tmpDir = null;
+            }
+            tmpDir = Files.createTempDirectory("gdocs2pdf");
+            Path data = tmpDir.resolve("tessdata");
+            Files.createDirectory(data);
+            for (String f : List.of("rus.traineddata", "eng.traineddata", "osd.traineddata")) {
+                InputStream is = getClass().getResourceAsStream("/tessdata/" + f);
+                if (is == null)
+                    throw new IOException("Отсутствует: /tessdata/" + f);
+                Files.copy(is, data.resolve(f));
+            }
+            tesseract = new Tesseract();
+            tesseract.setDatapath(data.toAbsolutePath().toString());
+            tesseract.setLanguage("rus+eng");
+            tesseract.setPageSegMode(1);
+            tesseract.setOcrEngineMode(1);
+            tesseract.setVariable("user_defined_dpi", String.valueOf((int) (96 * Google.SCALE)));
+            log(chatId, "OCR готов");
+        }
+
+        private Path getCachePath() {
+            String os = System.getProperty("os.name").toLowerCase();
+            String home = System.getProperty("user.home");
+            if (os.contains("win"))
+                return Paths.get(home, "AppData", "Local", "ms-playwright");
+            if (os.contains("mac") || os.contains("darwin"))
+                return Paths.get(home, "Library", "Caches", "ms-playwright");
+            return Paths.get(home, ".cache", "ms-playwright");
+        }
+
+        private static boolean isCssBold(String style) {
+            if (style == null || style.isEmpty())
+                return false;
+            if (style.matches("(?i).*font-weight\\s*:\\s*(bold|bolder).*"))
+                return true;
+            Matcher m = Pattern.compile("(?i)font-weight\\s*:\\s*(\\d+)").matcher(style);
+            if (m.find())
+                return Integer.parseInt(m.group(1)) >= 700;
+            return false;
+        }
+
+        private static boolean isCssItalic(String style) {
+            if (style == null || style.isEmpty())
+                return false;
+            return style.matches("(?i).*font-style\\s*:\\s*(italic|oblique).*");
+        }
+
+        private static String escapeHtml(String text) {
+            if (text == null)
+                return "";
+            return text.replace("&", "&amp;").replace("<", "&lt;")
+                    .replace(">", "&gt;").replace("\"", "&quot;").replace("'", "&#39;");
+        }
+
+        private void log(long chatId, String msg) {
+            System.out.println("[" + chatId + "] " + msg);
+            sendText(chatId, "" + msg, null);
+        }
+
+        private void sendModeKeyboard(long chatId, String text) {
+            KeyboardRow row1 = new KeyboardRow();
+            row1.add("OCR");
+
+            KeyboardRow row2 = new KeyboardRow();
+            row2.add("OCR+OnlyText");
+
+            KeyboardRow row3 = new KeyboardRow();
+            row3.add("HTML");
+
+            ReplyKeyboardMarkup keyboard = ReplyKeyboardMarkup.builder()
+                    .keyboard(List.of(row1, row2, row3))
+                    .resizeKeyboard(true)
+                    .oneTimeKeyboard(false)
+                    .build();
+
+            sendText(chatId, text, keyboard);
+        }
+
+        private void sendText(long chatId, String text,
+                org.telegram.telegrambots.meta.api.objects.replykeyboard.ReplyKeyboard keyboard) {
+            try {
+                SendMessage msg = SendMessage.builder()
+                        .chatId(String.valueOf(chatId))
+                        .text(text)
+                        .replyMarkup(keyboard)
+                        .build();
+                execute(msg);
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
+
+        private void sendDocument(long chatId, File file, String caption) {
+            try {
+                execute(SendDocument.builder()
+                        .chatId(String.valueOf(chatId))
+                        .document(new InputFile(file))
+                        .caption(caption)
+                        .build());
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
+
+        private ReplyKeyboardRemove removeKeyboard() {
+            return ReplyKeyboardRemove.builder().removeKeyboard(true).build();
+        }
+    }
 }
