@@ -8,7 +8,6 @@ import net.sourceforge.tess4j.ITessAPI;
 import net.sourceforge.tess4j.Tesseract;
 import net.sourceforge.tess4j.Word;
 
-import org.apache.commons.io.FileUtils;
 import org.apache.pdfbox.pdmodel.*;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
 import org.apache.pdfbox.pdmodel.font.PDFont;
@@ -20,9 +19,11 @@ import javax.imageio.ImageIO;
 import java.awt.Rectangle;
 import java.awt.image.BufferedImage;
 import java.io.*;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.logging.*;
 import java.util.regex.*;
 
 import org.jsoup.Jsoup;
@@ -30,7 +31,6 @@ import org.jsoup.nodes.Document;
 import org.jsoup.nodes.Element;
 import org.jsoup.nodes.Node;
 import org.jsoup.nodes.TextNode;
-
 import org.telegram.telegrambots.bots.TelegramLongPollingBot;
 import org.telegram.telegrambots.meta.TelegramBotsApi;
 import org.telegram.telegrambots.meta.api.methods.send.SendDocument;
@@ -43,17 +43,49 @@ import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.Keyboard
 import org.telegram.telegrambots.updatesreceivers.DefaultBotSession;
 
 public class Main {
+    private static final Logger LOG = Logger.getLogger(Main.class.getName());
 
     public static void main(String[] args) throws Exception {
+        setupLogging();
+
         String username = "GoogleDocs2PDFBot";
         String token;
-        try (BufferedReader in = new BufferedReader(new FileReader("token"))) {
-            token = in.readLine().strip();
+        try (BufferedReader in = new BufferedReader(
+                new FileReader("token", StandardCharsets.UTF_8))) {
+            token = in.readLine();
+            if (token == null || token.strip().isEmpty())
+                throw new IllegalStateException("Файл token пуст");
+            token = token.strip();
+        } catch (FileNotFoundException e) {
+            throw new IllegalStateException("Файл 'token' не найден рядом с jar", e);
         }
 
+        GDocsBot bot = new GDocsBot(token, username);
+
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            LOG.info("Завершение работы бота...");
+            bot.shutdown();
+            LOG.info("Бот остановлен.");
+        }, "shutdown-hook"));
+
         TelegramBotsApi api = new TelegramBotsApi(DefaultBotSession.class);
-        api.registerBot(new GDocsBot(token, username));
-        System.out.println("Бот запущен: @" + username);
+        api.registerBot(bot);
+        LOG.info("Бот запущен: @" + username);
+    }
+
+    private static void setupLogging() throws IOException {
+        Logger root = Logger.getLogger("");
+        root.setLevel(Level.INFO);
+
+        ConsoleHandler console = new ConsoleHandler();
+        console.setFormatter(new SimpleFormatter());
+        console.setLevel(Level.INFO);
+        root.addHandler(console);
+
+        FileHandler file = new FileHandler("bot.log", 10 * 1024 * 1024, 5, true);
+        file.setFormatter(new SimpleFormatter());
+        file.setLevel(Level.INFO);
+        root.addHandler(file);
     }
 
     enum Google {
@@ -69,8 +101,9 @@ public class Main {
         static final String PREVIEW = "/preview";
         static final String MOBILE_BASIC = "/mobilebasic";
         static final String HTML_PRESENT = "/htmlpresent";
-        static final double SCALE = 3.0;
+        static final double SCALE = 2.0;
         static final int MAX_PAGES = 1000;
+        static final long MAX_FILE_BYTES = 50L * 1024 * 1024;
 
         final int width, height;
         final String prefix, regex;
@@ -101,13 +134,29 @@ public class Main {
 
     static class GDocsBot extends TelegramLongPollingBot {
 
+        private static final Logger LOG = Logger.getLogger(GDocsBot.class.getName());
+
+        private static final int MAX_PARALLEL = 4;
+
         private final String username;
 
-        private final Map<Long, Session> sessions = new ConcurrentHashMap<>();
-        private final ExecutorService executor = Executors.newCachedThreadPool();
+        private final Map<Long, Session> sessions = Collections.synchronizedMap(
+                new LinkedHashMap<>(256, 0.75f, true) {
+                    @Override
+                    protected boolean removeEldestEntry(Map.Entry<Long, Session> eldest) {
+                        return size() > 10_000;
+                    }
+                });
 
-        private volatile Tesseract tesseract;
-        private volatile Path tmpDir;
+        private final ThreadPoolExecutor executor = (ThreadPoolExecutor) Executors.newFixedThreadPool(MAX_PARALLEL,
+                r -> {
+                    Thread t = new Thread(r, "converter-thread");
+                    t.setDaemon(false);
+                    return t;
+                });
+
+        private volatile Path tessDataDir = null;
+        private final Object tessInitLock = new Object();
 
         public GDocsBot(String token, String username) {
             super(token);
@@ -117,6 +166,19 @@ public class Main {
         @Override
         public String getBotUsername() {
             return username;
+        }
+
+        public void shutdown() {
+            executor.shutdown();
+            try {
+                if (!executor.awaitTermination(30, TimeUnit.SECONDS)) {
+                    LOG.warning("Принудительное завершение потоков...");
+                    executor.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                executor.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
         }
 
         @Override
@@ -130,6 +192,10 @@ public class Main {
             Session session = sessions.computeIfAbsent(chatId, id -> new Session());
 
             if (text.equals("/start") || text.equals("/reset")) {
+                if (session.state == State.PROCESSING) {
+                    sendText(chatId, "Обработка уже идёт, подожди...", null);
+                    return;
+                }
                 session.state = State.AWAITING_MODE;
                 session.mode = null;
                 sendModeKeyboard(chatId, "Привет! Выбери режим обработки:");
@@ -139,7 +205,8 @@ public class Main {
             switch (session.state) {
                 case AWAITING_MODE -> handleMode(chatId, text, session);
                 case AWAITING_URL -> handleUrl(chatId, text, session);
-                case PROCESSING -> sendText(chatId, "Уже обрабатываю твой запрос, подожди...", null);
+                case PROCESSING -> sendText(chatId,
+                        "Уже обрабатываю твой запрос, подожди...", null);
             }
         }
 
@@ -164,6 +231,12 @@ public class Main {
         }
 
         private void handleUrl(long chatId, String text, Session session) {
+            if (session.mode == null) {
+                session.state = State.AWAITING_MODE;
+                sendModeKeyboard(chatId, "Сначала выбери режим:");
+                return;
+            }
+
             if (!text.startsWith("http://") && !text.startsWith("https://")) {
                 sendText(chatId, "Не похоже на URL. Пришли ссылку, начинающуюся с https://", null);
                 return;
@@ -172,15 +245,22 @@ public class Main {
             Link link = parseLink(text, session.mode);
             if (link == null) {
                 sendText(chatId,
-                        "Ссылка не распознана.\nПоддерживаются:\n" +
-                                "• https://docs.google.com/presentation/d/...\n" +
-                                "• https://docs.google.com/document/d/...",
+                        "Ссылка не распознана. Поддерживаются:\n" +
+                                "• docs.google.com/presentation/d/...\n" +
+                                "• docs.google.com/document/d/...",
                         null);
                 return;
             }
 
+            int queued = executor.getQueue().size();
+            if (queued > 0) {
+                sendText(chatId, "В очереди " + queued +
+                        " задач. Твой запрос принят, ожидай...", null);
+            } else {
+                sendText(chatId, "Начинаю обработку, это может занять несколько минут...", null);
+            }
+
             session.state = State.PROCESSING;
-            sendText(chatId, "Начинаю обработку, это может занять несколько минут...", null);
 
             executor.submit(() -> {
                 File result = null;
@@ -188,8 +268,8 @@ public class Main {
                     result = process(link, session.mode, chatId);
                     sendDocument(chatId, result, "Готово!");
                 } catch (Exception e) {
+                    LOG.log(Level.SEVERE, "Ошибка обработки для chatId=" + chatId, e);
                     sendText(chatId, "Ошибка: " + e.getMessage(), null);
-                    e.printStackTrace();
                 } finally {
                     if (result != null)
                         result.delete();
@@ -203,8 +283,8 @@ public class Main {
         private File process(Link link, Mode mode, long chatId) throws Exception {
             if (mode == Mode.HTML) {
                 File out = File.createTempFile("gdocs_", ".html");
-                try (FileWriter fw = new FileWriter(out, java.nio.charset.StandardCharsets.UTF_8)) {
-                    log(chatId, "HTML: " + link.url());
+                try (FileWriter fw = new FileWriter(out, StandardCharsets.UTF_8)) {
+                    logUser(chatId, "HTML: " + link.url());
                     parseSinglePageHtmlMode(link, fw, chatId);
                 }
                 return out;
@@ -215,7 +295,7 @@ public class Main {
 
             ensureChromiumInstalled(chatId);
             if (ocr)
-                ensureTesseractReady(chatId);
+                ensureTessDataReady(chatId);
 
             File out = File.createTempFile("gdocs_", ".pdf");
             try (PDDocument pdf = new PDDocument();
@@ -227,10 +307,42 @@ public class Main {
                                     .setDeviceScaleFactor(Google.SCALE));
                     Page page = ctx.newPage()) {
 
-                parsePage(page, link, pdf, ocr, onlyTxt, chatId);
+                Tesseract localTess = ocr ? buildTesseract() : null;
+                parsePage(page, link, pdf, ocr, onlyTxt, chatId, localTess);
                 pdf.save(out);
             }
             return out;
+        }
+
+        private void ensureTessDataReady(long chatId) throws IOException {
+            if (tessDataDir != null)
+                return;
+            synchronized (tessInitLock) {
+                if (tessDataDir != null)
+                    return;
+                logUser(chatId, "Подготовка tessdata...");
+                Path tmp = Files.createTempDirectory("gdocs2pdf");
+                Path data = tmp.resolve("tessdata");
+                Files.createDirectory(data);
+                for (String f : List.of("rus.traineddata", "eng.traineddata", "osd.traineddata")) {
+                    InputStream is = getClass().getResourceAsStream("/tessdata/" + f);
+                    if (is == null)
+                        throw new IOException("Отсутствует: /tessdata/" + f);
+                    Files.copy(is, data.resolve(f));
+                }
+                tessDataDir = data;
+                logUser(chatId, "tessdata готова");
+            }
+        }
+
+        private Tesseract buildTesseract() {
+            Tesseract t = new Tesseract();
+            t.setDatapath(tessDataDir.toAbsolutePath().toString());
+            t.setLanguage("rus+eng");
+            t.setPageSegMode(1);
+            t.setOcrEngineMode(1);
+            t.setVariable("user_defined_dpi", String.valueOf((int) (96 * Google.SCALE)));
+            return t;
         }
 
         private void parseSinglePageHtmlMode(Link link, FileWriter out, long chatId)
@@ -250,7 +362,7 @@ public class Main {
 
             renderNode(doc.body(), out);
             out.append("</body></html>");
-            log(chatId, "HTML собран: " + title);
+            logUser(chatId, "HTML собран: " + title);
         }
 
         private void renderNode(Node node, FileWriter out) throws IOException {
@@ -419,7 +531,8 @@ public class Main {
         }
 
         private void parsePage(Page page, Link link, PDDocument pdf,
-                boolean ocr, boolean txt, long chatId) throws IOException {
+                boolean ocr, boolean txt,
+                long chatId, Tesseract tess) throws IOException {
             page.setViewportSize(link.t().width, link.t().height);
 
             PDFont font = null;
@@ -460,16 +573,18 @@ public class Main {
                     }
 
                     if (Arrays.equals(prev, shot)) {
-                        log(chatId, "Страниц всего: " + saved);
+                        logUser(chatId, "Страниц всего: " + saved);
                         return;
                     }
 
                     try {
-                        addPage(pdf, shot, num, font, txt, chatId);
+                        addPage(pdf, shot, num, font, txt, chatId, tess);
                         saved++;
-                        log(chatId, "Страница: " + num);
+                        if (saved == 1 || saved % 10 == 0)
+                            logUser(chatId, "Обработано страниц: " + saved);
                     } catch (Exception e) {
-                        log(chatId, "Страница " + num + " пропущена: " + e);
+                        LOG.log(Level.WARNING, "Страница " + num + " пропущена", e);
+                        logUser(chatId, "Страница " + num + " пропущена: " + e.getMessage());
                     }
 
                     prev = shot;
@@ -483,18 +598,20 @@ public class Main {
                 } catch (Exception e) {
                     if (num == 1)
                         throw new IOException("Ошибка загрузки первой страницы", e);
-                    log(chatId, "Страница " + num + " недоступна: " + e);
+                    LOG.log(Level.WARNING, "Страница " + num + " недоступна", e);
+                    logUser(chatId, "Страница " + num + " недоступна: " + e.getMessage());
                     if (link.t() == Google.Presentation && prev != null) {
-                        log(chatId, "Страниц всего: " + saved);
+                        logUser(chatId, "Страниц всего: " + saved);
                         return;
                     }
                 }
             }
-            log(chatId, "ВНИМАНИЕ: достигнут лимит " + Google.MAX_PAGES + " страниц");
+            logUser(chatId, "ВНИМАНИЕ: достигнут лимит " + Google.MAX_PAGES + " страниц");
         }
 
         private void addPage(PDDocument pdf, byte[] shot, int num,
-                PDFont font, boolean txt, long chatId) throws IOException {
+                PDFont font, boolean txt,
+                long chatId, Tesseract tess) throws IOException {
             BufferedImage image = ImageIO.read(new ByteArrayInputStream(shot));
             if (image == null)
                 throw new IOException("Ошибка декодирования скриншота на стр. " + num);
@@ -508,16 +625,16 @@ public class Main {
             try (PDPageContentStream stream = new PDPageContentStream(pdf, pdfPage)) {
                 if (!txt)
                     stream.drawImage(pdImg, 0, 0, pageWidth, pageHeight);
-                if (font == null || tesseract == null)
+                if (font == null || tess == null)
                     return;
 
                 List<Word> lines;
                 try {
-                    lines = tesseract.getWords(image,
+                    lines = tess.getWords(image,
                             txt ? ITessAPI.TessPageIteratorLevel.RIL_TEXTLINE
                                     : ITessAPI.TessPageIteratorLevel.RIL_WORD);
                 } catch (Exception e) {
-                    log(chatId, "OCR ошибка на стр. " + num + ": " + e);
+                    LOG.log(Level.WARNING, "OCR ошибка на стр. " + num, e);
                     return;
                 }
                 if (lines == null || lines.isEmpty())
@@ -550,7 +667,6 @@ public class Main {
                         try {
                             textWidth = font.getStringWidth(text) / 1000f * fontSize;
                         } catch (Exception e) {
-                            log(chatId, "OCR: невозможно измерить ширину \"" + text + "\": " + e);
                             continue;
                         }
                         if (textWidth <= 0)
@@ -558,8 +674,7 @@ public class Main {
                         horizScaling = (boxWidth / textWidth) * 100f;
                     } else {
                         pdfY = pageHeight - (bbox.y + bbox.height) * scaleY;
-                        float baseHeight = bbox.height * scaleY * 0.85f;
-                        recentSizes.add(baseHeight);
+                        recentSizes.add(bbox.height * scaleY * 0.85f);
                         if (recentSizes.size() > 5)
                             recentSizes.removeFirst();
                         float sum = 0f;
@@ -576,7 +691,7 @@ public class Main {
                     try {
                         stream.showText(text);
                     } catch (Exception e) {
-                        log(chatId, "OCR ошибка слова \"" + text + "\" стр. " + num + ": " + e);
+                        LOG.warning("OCR showText ошибка стр. " + num + ": " + e.getMessage());
                     } finally {
                         stream.endText();
                     }
@@ -586,30 +701,27 @@ public class Main {
         }
 
         private Link parseLink(String rawUrl, Mode mode) {
-            boolean htmlMode = (mode == Mode.HTML);
+            boolean html = (mode == Mode.HTML);
 
             Matcher slides = Pattern.compile(Google.Presentation.regex).matcher(rawUrl);
             if (slides.find()) {
-                String suffix = htmlMode ? Google.HTML_PRESENT : Google.PREVIEW;
                 return new Link(Google.Presentation,
-                        Google.Presentation.prefix + slides.group(1) + suffix);
+                        Google.Presentation.prefix + slides.group(1) +
+                                (html ? Google.HTML_PRESENT : Google.PREVIEW));
             }
             Matcher docs = Pattern.compile(Google.Document.regex).matcher(rawUrl);
             if (docs.find()) {
-                String suffix = htmlMode ? Google.MOBILE_BASIC : Google.PREVIEW;
                 return new Link(Google.Document,
-                        Google.Document.prefix + docs.group(1) + suffix);
+                        Google.Document.prefix + docs.group(1) +
+                                (html ? Google.MOBILE_BASIC : Google.PREVIEW));
             }
             return null;
         }
 
         private void ensureChromiumInstalled(long chatId) throws IOException, InterruptedException {
-            Path cache = getCachePath();
-            if (Files.exists(cache)) {
-                log(chatId, "Chromium уже установлен");
+            if (Files.exists(getCachePath()))
                 return;
-            }
-            log(chatId, "Устанавливаю Chromium...");
+            logUser(chatId, "Устанавливаю Chromium (первый запуск)...");
             ProcessBuilder pb = new ProcessBuilder(
                     "java", "-cp", System.getProperty("java.class.path"),
                     "com.microsoft.playwright.CLI", "install", "chromium");
@@ -617,33 +729,7 @@ public class Main {
             int code = pb.start().waitFor();
             if (code != 0)
                 throw new IOException("Chromium: код выхода " + code);
-            log(chatId, "Chromium установлен");
-        }
-
-        private synchronized void ensureTesseractReady(long chatId) throws IOException {
-            if (tesseract != null)
-                return;
-            log(chatId, "Подготовка OCR...");
-            if (tmpDir != null) {
-                FileUtils.deleteQuietly(tmpDir.toFile());
-                tmpDir = null;
-            }
-            tmpDir = Files.createTempDirectory("gdocs2pdf");
-            Path data = tmpDir.resolve("tessdata");
-            Files.createDirectory(data);
-            for (String f : List.of("rus.traineddata", "eng.traineddata", "osd.traineddata")) {
-                InputStream is = getClass().getResourceAsStream("/tessdata/" + f);
-                if (is == null)
-                    throw new IOException("Отсутствует: /tessdata/" + f);
-                Files.copy(is, data.resolve(f));
-            }
-            tesseract = new Tesseract();
-            tesseract.setDatapath(data.toAbsolutePath().toString());
-            tesseract.setLanguage("rus+eng");
-            tesseract.setPageSegMode(1);
-            tesseract.setOcrEngineMode(1);
-            tesseract.setVariable("user_defined_dpi", String.valueOf((int) (96 * Google.SCALE)));
-            log(chatId, "OCR готов");
+            logUser(chatId, "Chromium установлен");
         }
 
         private Path getCachePath() {
@@ -662,9 +748,7 @@ public class Main {
             if (style.matches("(?i).*font-weight\\s*:\\s*(bold|bolder).*"))
                 return true;
             Matcher m = Pattern.compile("(?i)font-weight\\s*:\\s*(\\d+)").matcher(style);
-            if (m.find())
-                return Integer.parseInt(m.group(1)) >= 700;
-            return false;
+            return m.find() && Integer.parseInt(m.group(1)) >= 700;
         }
 
         private static boolean isCssItalic(String style) {
@@ -680,45 +764,49 @@ public class Main {
                     .replace(">", "&gt;").replace("\"", "&quot;").replace("'", "&#39;");
         }
 
-        private void log(long chatId, String msg) {
-            System.out.println("[" + chatId + "] " + msg);
-            sendText(chatId, "" + msg, null);
+        private void logUser(long chatId, String msg) {
+            LOG.info("[" + chatId + "] " + msg);
+            sendText(chatId, msg, null);
         }
 
         private void sendModeKeyboard(long chatId, String text) {
             KeyboardRow row1 = new KeyboardRow();
             row1.add("OCR");
-
             KeyboardRow row2 = new KeyboardRow();
             row2.add("OCR+OnlyText");
-
             KeyboardRow row3 = new KeyboardRow();
             row3.add("HTML");
 
-            ReplyKeyboardMarkup keyboard = ReplyKeyboardMarkup.builder()
+            sendText(chatId, text, ReplyKeyboardMarkup.builder()
                     .keyboard(List.of(row1, row2, row3))
                     .resizeKeyboard(true)
                     .oneTimeKeyboard(false)
-                    .build();
-
-            sendText(chatId, text, keyboard);
+                    .build());
         }
 
         private void sendText(long chatId, String text,
                 org.telegram.telegrambots.meta.api.objects.replykeyboard.ReplyKeyboard keyboard) {
             try {
-                SendMessage msg = SendMessage.builder()
+                execute(SendMessage.builder()
                         .chatId(String.valueOf(chatId))
                         .text(text)
+                        .parseMode("Markdown")
                         .replyMarkup(keyboard)
-                        .build();
-                execute(msg);
+                        .build());
             } catch (Exception e) {
-                e.printStackTrace();
+                LOG.log(Level.WARNING, "sendText ошибка chatId=" + chatId, e);
             }
         }
 
         private void sendDocument(long chatId, File file, String caption) {
+            if (file.length() > Google.MAX_FILE_BYTES) {
+                long mb = file.length() / 1024 / 1024;
+                sendText(chatId,
+                        "Файл слишком большой (" + mb + " MB). Лимит Telegram — 50 MB.\n" +
+                                "Попробуй режим HTML или уменьши документ.",
+                        null);
+                return;
+            }
             try {
                 execute(SendDocument.builder()
                         .chatId(String.valueOf(chatId))
@@ -726,7 +814,8 @@ public class Main {
                         .caption(caption)
                         .build());
             } catch (Exception e) {
-                e.printStackTrace();
+                LOG.log(Level.SEVERE, "sendDocument ошибка chatId=" + chatId, e);
+                sendText(chatId, "Не удалось отправить файл: " + e.getMessage(), null);
             }
         }
 
