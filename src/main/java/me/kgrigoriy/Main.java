@@ -90,7 +90,7 @@ public class Main {
         @Override
         public void start(Stage stage) {
             this.primaryStage = stage;
-            stage.setTitle("GoogleDocs2PDF by KGrigoriy for Anna💕 v1.0");
+            stage.setTitle("GoogleDocs2PDF by Grigoriy for Anna💕 v1.0");
 
             InputStream iconStream = getClass().getResourceAsStream("/icon.png");
             if (iconStream != null) {
@@ -323,7 +323,7 @@ public class Main {
                     if (link.t() == Google.Document) {
                         BufferedImage original = ImageIO.read(new ByteArrayInputStream(shot));
                         if (original == null)
-                            throw new IOException("Не удалось декодировать скриншот");
+                            throw new IOException("Ошибка декодирования скриншота");
                         int cropWidth = Math.min((int) (Google.DOC_WIDTH * Google.SCALE), original.getWidth());
                         int x = Math.max(0, (original.getWidth() - cropWidth) / 2);
                         BufferedImage cropped = original.getSubimage(x, 0, cropWidth, original.getHeight());
@@ -384,134 +384,67 @@ public class Main {
                 if (font == null || tesseract == null)
                     return;
 
-                List<Word> words;
+                List<Word> lines;
                 try {
-                    words = tesseract.getWords(image, ITessAPI.TessPageIteratorLevel.RIL_WORD);
+                    lines = tesseract.getWords(image, ITessAPI.TessPageIteratorLevel.RIL_TEXTLINE);
                 } catch (Exception e) {
                     log("OCR ошибка на странице " + num + ": " + e);
                     return;
                 }
-                if (words == null || words.isEmpty())
+                if (lines == null || lines.isEmpty())
                     return;
 
                 stream.setRenderingMode(txt ? RenderingMode.FILL : RenderingMode.NEITHER);
 
                 float scaleX = pageWidth / image.getWidth();
                 float scaleY = pageHeight / image.getHeight();
-                float lastFontSize = -1f;
-                float lastHScale = -1f;
 
-                if (txt) {
-                    List<List<Word>> lines = groupIntoLines(words);
+                List<Float> recentSizes = new ArrayList<>();
 
-                    List<Float> fontSizes = new ArrayList<>();
-                    for (List<Word> line : lines) {
-                        float sz = 0;
-                        for (Word w : line) {
-                            float h = w.getBoundingBox().height * scaleY;
-                            sz = Math.max(sz, Math.max(h * 0.85f, 1f));
+                for (Word line : lines) {
+                    String text = line.getText();
+                    if (text == null)
+                        continue;
+                    text = text.trim();
+                    if (text.isEmpty())
+                        continue;
+
+                    Rectangle bbox = line.getBoundingBox();
+
+                    float pdfX = bbox.x * scaleX;
+                    float pdfY = pageHeight - (bbox.y + bbox.height) * scaleY;
+                    float baseHeight = bbox.height * scaleY * 0.85f;
+
+                    float smoothedSize = baseHeight;
+                    if (!recentSizes.isEmpty()) {
+                        float totalWeighted = 0f;
+                        float totalWeight = 0f;
+                        for (int i = 0; i < Math.min(3, recentSizes.size()); i++) {
+                            float weight = 0.5f - (i * 0.1f);
+                            totalWeighted += recentSizes.get(recentSizes.size() - 1 - i) * weight;
+                            totalWeight += weight;
                         }
-                        fontSizes.add(sz);
-                    }
-                    Collections.sort(fontSizes);
-                    float pageFontSize = fontSizes.get(fontSizes.size() / 2);
-
-                    stream.setFont(font, pageFontSize);
-                    stream.setHorizontalScaling(100f);
-
-                    for (List<Word> line : lines) {
-                        float lineBottom = 0;
-                        for (Word w : line)
-                            lineBottom = Math.max(lineBottom,
-                                    (w.getBoundingBox().y + w.getBoundingBox().height) * scaleY);
-                        float pdfLineY = pageHeight - lineBottom;
-
-                        for (Word word : line) {
-                            String text = word.getText().trim();
-                            if (text.isEmpty())
-                                continue;
-
-                            float pdfX = word.getBoundingBox().x * scaleX;
-
-                            stream.beginText();
-                            stream.newLineAtOffset(pdfX, pdfLineY);
-                            try {
-                                stream.showText(text);
-                            } catch (Exception e) {
-                                log("OCR ошибка при обработке " + text + " на странице " + num + ": " + e);
-                            } finally {
-                                stream.endText();
-                            }
-                        }
+                        smoothedSize = (baseHeight * 0.6f + totalWeighted / totalWeight * 0.4f);
                     }
 
-                } else {
-                    for (Word word : words) {
-                        String text = word.getText().trim();
-                        if (text.isEmpty())
-                            continue;
+                    smoothedSize = Math.max(smoothedSize, 8f);
+                    recentSizes.add(smoothedSize);
+                    if (recentSizes.size() > 5)
+                        recentSizes.remove(0);
 
-                        Rectangle bbox = word.getBoundingBox();
-                        float pdfX = bbox.x * scaleX;
-                        float pdfY = pageHeight - (bbox.y + bbox.height) * scaleY;
-                        float pdfWidth = bbox.width * scaleX;
-                        float pdfHeight = bbox.height * scaleY;
-                        float fontSize = Math.max(pdfHeight * 0.85f, 1f);
+                    stream.setFont(font, smoothedSize);
 
-                        try {
-                            float textWidth = font.getStringWidth(text) / 1000f * fontSize;
-                            if (textWidth <= 0)
-                                continue;
-                            float hScale = Math.max(10f, Math.min((pdfWidth / textWidth) * 100f, 300f));
-
-                            if (fontSize != lastFontSize || hScale != lastHScale) {
-                                stream.setFont(font, fontSize);
-                                stream.setHorizontalScaling(hScale);
-                                lastFontSize = fontSize;
-                                lastHScale = hScale;
-                            }
-
-                            stream.beginText();
-                            stream.newLineAtOffset(pdfX, pdfY);
-                            try {
-                                stream.showText(text);
-                            } catch (Exception e) {
-                                log("OCR ошибка при обработке " + text + " на странице " + num + ": " + e);
-                            } finally {
-                                stream.endText();
-                            }
-                        } catch (Exception ignored) {
-                        }
+                    stream.beginText();
+                    stream.newLineAtOffset(pdfX, pdfY);
+                    try {
+                        stream.showText(text);
+                    } catch (Exception e) {
+                        log("OCR ошибка при обработке строки \"" + text + "\" на странице " + num + ": " + e);
+                    } finally {
+                        stream.endText();
                     }
                 }
             }
-        }
-
-        private List<List<Word>> groupIntoLines(List<Word> words) {
-            List<List<Word>> lines = new ArrayList<>();
-            List<int[]> spans = new ArrayList<>();
-
-            for (Word word : words) {
-                Rectangle bbox = word.getBoundingBox();
-                boolean added = false;
-                for (int i = 0; i < lines.size(); i++) {
-                    int[] span = spans.get(i);
-                    if (bbox.y < span[1] && bbox.y + bbox.height > span[0]) {
-                        lines.get(i).add(word);
-                        span[0] = Math.min(span[0], bbox.y);
-                        span[1] = Math.max(span[1], bbox.y + bbox.height);
-                        added = true;
-                        break;
-                    }
-                }
-                if (!added) {
-                    List<Word> newLine = new ArrayList<>();
-                    newLine.add(word);
-                    lines.add(newLine);
-                    spans.add(new int[] { bbox.y, bbox.y + bbox.height });
-                }
-            }
-            return lines;
         }
 
     }
